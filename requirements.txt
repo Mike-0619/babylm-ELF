@@ -1,0 +1,11 @@
+# Core training
+torch>=2.2
+
+# BabyLM data and tokenizer
+datasets>=2.12
+tokenizers>=0.15
+transformers>=4.38
+
+# Configs and progress bars
+PyYAML>=6.0
+tqdm>=4.65

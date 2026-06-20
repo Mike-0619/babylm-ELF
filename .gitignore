@@ -1,0 +1,17 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local BabyLM data
+/data/
+
+# Training logs and outputs
+/logs/
+/outputs/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Paper build artifacts
+paper

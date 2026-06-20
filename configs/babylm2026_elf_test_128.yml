@@ -1,0 +1,56 @@
+name: babylm2026_test_128
+seed: 42
+output_dir: outputs
+max_steps: 2000
+batch_size: 32
+gradient_accumulation_steps: 1
+log_every: 20
+validate_every: 1000
+save_every: 2000
+mixed_precision: true
+
+model:
+  vocab_size: 16384
+  hidden_size: 768
+  intermediate_size: 2048
+  num_hidden_layers: 12
+  num_attention_heads: 12
+  max_position_embeddings: 512
+  hidden_dropout_prob: 0.1
+  layer_norm_eps: 0.000001
+  pad_token_id: 3
+
+data:
+  source: huggingface
+  hf_dataset: BabyLM-community/BabyLM-2026-Strict
+  hf_config: null
+  hf_train_split: train
+  hf_valid_split: null
+  hf_text_field: text
+  train_text: data/babylm2026/raw/train_100M.txt
+  valid_text: null
+  train_path: data/babylm2026/tokenized/train_100M.bin
+  valid_path: null
+  tokenizer_path: data/babylm2026/tokenizer/tokenizer.json
+  tokenizer_vocab_size: 16384
+  tokenizer_min_frequency: 2
+  seq_length: 128
+  num_workers: 0
+
+optim:
+  optimizer: adamw
+  learning_rate: 0.0005
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.98
+  eps: 0.00000001
+  max_grad_norm: 2.0
+  warmup_steps: 1000
+  ema_decay: 0.999
+
+diffusion:
+  prediction_type: x0
+  time_schedule: linear
+  noise_scale: 1.0
+  flow_loss_weight: 1.0
+  decode_loss_weight: 0.25
