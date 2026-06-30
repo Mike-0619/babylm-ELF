@@ -7,6 +7,7 @@ import torch
 
 from babylm_elf.config import load_config
 from babylm_elf.data.datasets import export_hf_split_to_text
+from babylm_elf.data.text import iter_clean_documents
 from babylm_elf.data.tokenizer import load_tokenizer, train_bpe_tokenizer
 
 
@@ -23,7 +24,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--valid_text", type=Path)
     parser.add_argument("--tokenizer_path", type=Path)
     parser.add_argument("--vocab_size", type=int)
-    parser.add_argument("--min_frequency", type=int)
     parser.add_argument("--output_dir", type=Path)
     parser.add_argument("--train_tokenizer", action="store_true")
     parser.add_argument("--refresh_raw_text", action="store_true")
@@ -41,14 +41,21 @@ def main() -> None:
             plan.train_text,
             plan.tokenizer_path,
             vocab_size=plan.vocab_size,
-            min_frequency=plan.min_frequency,
         )
     else:
         tokenizer = load_tokenizer(plan.tokenizer_path)
 
-    tokenize_text_file(tokenizer, plan.train_text, plan.train_output_path)
+    tokenize_text_file(
+        tokenizer,
+        plan.train_text,
+        plan.train_output_path,
+    )
     if plan.valid_text is not None and plan.valid_output_path is not None:
-        tokenize_text_file(tokenizer, plan.valid_text, plan.valid_output_path)
+        tokenize_text_file(
+            tokenizer,
+            plan.valid_text,
+            plan.valid_output_path,
+        )
 
 
 class PreparePlan:
@@ -67,7 +74,6 @@ class PreparePlan:
         train_output_path: Path,
         valid_output_path: Path | None,
         vocab_size: int,
-        min_frequency: int,
         train_tokenizer: bool,
         refresh_raw_text: bool,
     ) -> None:
@@ -84,7 +90,6 @@ class PreparePlan:
         self.train_output_path = train_output_path
         self.valid_output_path = valid_output_path
         self.vocab_size = vocab_size
-        self.min_frequency = min_frequency
         self.train_tokenizer = train_tokenizer
         self.refresh_raw_text = refresh_raw_text
 
@@ -115,7 +120,6 @@ def prepare_plan_from_args(args: argparse.Namespace) -> PreparePlan:
     )
     if tokenizer_path is None:
         tokenizer_path = Path("data/tokenizer_100M.json")
-
     train_output_path = _path_from_config(data.train_path if data else None)
     valid_output_path = _path_from_config(data.valid_path if data else None)
 
@@ -138,12 +142,6 @@ def prepare_plan_from_args(args: argparse.Namespace) -> PreparePlan:
     if vocab_size is None:
         vocab_size = 16384
 
-    min_frequency = args.min_frequency
-    if min_frequency is None and data is not None:
-        min_frequency = data.tokenizer_min_frequency
-    if min_frequency is None:
-        min_frequency = 2
-
     return PreparePlan(
         source=source,
         hf_dataset=hf_dataset,
@@ -158,7 +156,6 @@ def prepare_plan_from_args(args: argparse.Namespace) -> PreparePlan:
         train_output_path=train_output_path,
         valid_output_path=valid_output_path,
         vocab_size=vocab_size,
-        min_frequency=min_frequency,
         train_tokenizer=args.train_tokenizer,
         refresh_raw_text=args.refresh_raw_text,
     )
@@ -202,17 +199,22 @@ def materialize_raw_text_if_needed(plan: PreparePlan) -> None:
             print(f"Using cached valid text at {plan.valid_text}")
 
 
-def tokenize_text_file(tokenizer, input_path: Path, output_path: Path) -> None:
+def tokenize_text_file(
+    tokenizer,
+    input_path: Path,
+    output_path: Path,
+) -> None:
     documents = []
-    with input_path.open("r", encoding="utf-8") as handle:
-        text = handle.read()
-    for document in text.split("\n\n"):
-        document = document.strip()
-        if document:
-            ids = tokenizer.encode(document, add_special_tokens=False).ids
-            documents.append(torch.tensor(ids, dtype=torch.int32))
+    n_subwords = 0
+    for document in iter_clean_documents(input_path):
+        ids = tokenizer.encode(document, add_special_tokens=False).ids
+        documents.append(torch.tensor(ids, dtype=torch.int16))
+        n_subwords += len(ids)
     torch.save(documents, output_path)
-    print(f"Saved {len(documents)} tokenized documents to {output_path}")
+    print(
+        f"Saved {len(documents)} tokenized documents with {n_subwords} subwords "
+        f"to {output_path}"
+    )
 
 
 if __name__ == "__main__":

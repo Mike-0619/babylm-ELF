@@ -7,21 +7,26 @@ def sample_timesteps(
     batch_size: int,
     device: torch.device,
     dtype: torch.dtype,
-    min_t: float = 1.0e-4,
-    max_t: float = 1.0,
+    p_mean: float,
+    p_std: float,
+    schedule: str,
 ) -> torch.Tensor:
-    return torch.empty(batch_size, device=device, dtype=dtype).uniform_(min_t, max_t)
+    if schedule == "logit_normal":
+        logits = torch.randn(batch_size, device=device, dtype=dtype)
+        return torch.sigmoid(logits * p_std + p_mean)
+    if schedule == "uniform":
+        return torch.rand(batch_size, device=device, dtype=dtype)
+    raise ValueError(f"Unknown time schedule: {schedule}")
 
 
-def alpha_sigma(
-    t: torch.Tensor,
-    time_schedule: str,
-    noise_scale: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if time_schedule == "linear":
-        return 1.0 - t, t * noise_scale
-    if time_schedule == "cosine":
-        theta = t * torch.pi / 2.0
-        return torch.cos(theta), torch.sin(theta) * noise_scale
-    raise ValueError(f"Unknown time_schedule: {time_schedule}")
-
+def sample_cfg_scale(
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    minimum: float,
+    maximum: float,
+) -> torch.Tensor:
+    uniform = torch.rand(batch_size, device=device, dtype=dtype)
+    low = 1.0 + minimum
+    high = 1.0 + maximum
+    return low * torch.exp(uniform * torch.log(torch.tensor(high / low, device=device))) - 1.0

@@ -12,7 +12,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/babylm2026_elf_base.yml"),
+        default=Path("configs/2026_100M_adamW.yml"),
     )
     return parser.parse_args()
 

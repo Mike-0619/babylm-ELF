@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=train_babylm2025
+#SBATCH --job-name=train_2026_10M_adamW
 #SBATCH --output=/dss/dssfs05/lwp-dss-0003/pn39je/pn39je-dss-0004/go46wuw2_2/projects/diffusion-lm/new-project/babylm-ELF/logs/%j.out
 #SBATCH --error=/dss/dssfs05/lwp-dss-0003/pn39je/pn39je-dss-0004/go46wuw2_2/projects/diffusion-lm/new-project/babylm-ELF/logs/%j.err
 
@@ -8,7 +8,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --time=20:00:00
+#SBATCH --time=08:00:00
 
 
 cd /dss/dssfs05/lwp-dss-0003/pn39je/pn39je-dss-0004/go46wuw2_2/projects/diffusion-lm/new-project/babylm-ELF
@@ -18,4 +18,4 @@ conda activate babylm-elf
 
 mkdir -p logs
 
-srun python -m babylm_elf.cli.train --config configs/babylm2025_elf_base.yml
+srun python -m babylm_elf.cli.train --config configs/2026_10M_adamW.yml

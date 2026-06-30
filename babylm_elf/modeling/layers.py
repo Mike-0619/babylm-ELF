@@ -7,96 +7,196 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class TimestepEmbedder(nn.Module):
-    """Sinusoidal scalar timestep embedding followed by a small MLP."""
+def _init_linear(layer: nn.Linear, zero: bool = False) -> nn.Linear:
+    if zero:
+        nn.init.zeros_(layer.weight)
+    else:
+        nn.init.xavier_uniform_(layer.weight)
+    if layer.bias is not None:
+        nn.init.zeros_(layer.bias)
+    return layer
 
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
+    return torch.stack((-x2, x1), dim=-1).flatten(-2)
+
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim: int, max_length: int, prefix_length: int, theta: float = 10000.0) -> None:
+        super().__init__()
+        self.dim = dim
+        self.max_length = max_length
+        self.prefix_length = prefix_length
+        self.theta = theta
+        cos, sin = self._build_buffers()
+        self.register_buffer("cos", cos, persistent=False)
+        self.register_buffer("sin", sin, persistent=False)
+
+    def _build_buffers(self) -> tuple[torch.Tensor, torch.Tensor]:
+        inv_freq = 1.0 / (
+            self.theta
+            ** (
+                torch.arange(0, self.dim, 2, dtype=torch.float32)[: self.dim // 2]
+                / self.dim
+            )
+        )
+        positions = torch.arange(self.max_length, dtype=torch.float32)
+        freqs = torch.outer(positions, inv_freq).repeat_interleave(2, dim=-1)
+        cos = torch.cat(
+            (torch.ones(self.prefix_length, self.dim), freqs.cos()),
+            dim=0,
+        )
+        sin = torch.cat(
+            (torch.zeros(self.prefix_length, self.dim), freqs.sin()),
+            dim=0,
+        )
+        return cos, sin
+
+    def reset_buffers(self) -> None:
+        cos, sin = self._build_buffers()
+        self.cos = cos.to(device=self.cos.device)
+        self.sin = sin.to(device=self.sin.device)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        length = x.size(-2)
+        cos = self.cos[:length].to(device=x.device, dtype=x.dtype)
+        sin = self.sin[:length].to(device=x.device, dtype=x.dtype)
+        return x * cos + rotate_half(x) * sin
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, hidden_size: int, eps: float = 1.0e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
+        variance = x.float().square().mean(dim=-1, keepdim=True)
+        return self.weight.to(dtype) * (x * torch.rsqrt(variance + self.eps).to(dtype))
+
+
+class BottleneckProjection(nn.Module):
+    def __init__(self, input_size: int, hidden_size: int, bottleneck_size: int) -> None:
+        super().__init__()
+        self.down = _init_linear(nn.Linear(input_size, bottleneck_size, bias=False))
+        self.up = _init_linear(nn.Linear(bottleneck_size, hidden_size))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.up(self.down(x))
+
+
+class TimestepEmbedder(nn.Module):
     def __init__(self, hidden_size: int, frequency_size: int = 256) -> None:
         super().__init__()
         self.frequency_size = frequency_size
-        self.mlp = nn.Sequential(
-            nn.Linear(frequency_size, hidden_size),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size),
-        )
+        self.linear1 = nn.Linear(frequency_size, hidden_size)
+        self.linear2 = nn.Linear(hidden_size, hidden_size)
+        nn.init.normal_(self.linear1.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.linear2.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.linear1.bias)
+        nn.init.zeros_(self.linear2.bias)
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         half = self.frequency_size // 2
-        freqs = torch.exp(
+        frequencies = torch.exp(
             -math.log(10000.0)
-            * torch.arange(half, dtype=torch.float32, device=t.device)
+            * torch.arange(half, device=t.device, dtype=torch.float32)
             / max(1, half)
         )
-        args = t.float().unsqueeze(-1) * freqs.unsqueeze(0)
-        emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        args = t.float().unsqueeze(-1) * frequencies.unsqueeze(0)
+        embedding = torch.cat((args.cos(), args.sin()), dim=-1)
         if self.frequency_size % 2:
-            emb = torch.cat([emb, emb.new_zeros(emb.size(0), 1)], dim=-1)
-        return self.mlp(emb)
+            embedding = F.pad(embedding, (0, 1))
+        return self.linear2(F.silu(self.linear1(embedding)))
 
 
-class SwiGLUFFN(nn.Module):
-    """Transformer feed-forward block with SwiGLU gating."""
-
-    def __init__(self, hidden_size: int, intermediate_size: int, dropout: float) -> None:
+class Attention(nn.Module):
+    def __init__(self, hidden_size: int, num_heads: int, dropout: float) -> None:
         super().__init__()
-        self.gate_proj = nn.Linear(hidden_size, 2 * intermediate_size)
-        self.out_proj = nn.Linear(intermediate_size, hidden_size)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        value, gate = self.gate_proj(x).chunk(2, dim=-1)
-        x = value * F.silu(gate)
-        return self.dropout(self.out_proj(x))
-
-
-class ELFBlock(nn.Module):
-    """Bidirectional denoising Transformer block with timestep modulation."""
-
-    def __init__(
-        self,
-        hidden_size: int,
-        num_heads: int,
-        intermediate_size: int,
-        dropout: float,
-        layer_norm_eps: float,
-    ) -> None:
-        super().__init__()
-        self.norm_attn = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=hidden_size,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.norm_ffn = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
-        self.ffn = SwiGLUFFN(hidden_size, intermediate_size, dropout)
-        self.time_mod = nn.Linear(hidden_size, 4 * hidden_size)
-        nn.init.zeros_(self.time_mod.weight)
-        nn.init.zeros_(self.time_mod.bias)
+        if hidden_size % num_heads:
+            raise ValueError("hidden_size must be divisible by num_heads")
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.dropout = dropout
+        self.qkv = _init_linear(nn.Linear(hidden_size, 3 * hidden_size))
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
+        self.out = _init_linear(nn.Linear(hidden_size, hidden_size))
 
     def forward(
         self,
         x: torch.Tensor,
-        time_emb: torch.Tensor,
-        key_padding_mask: torch.Tensor | None = None,
+        rope: RotaryEmbedding,
+        attention_mask: torch.Tensor | None,
     ) -> torch.Tensor:
-        shift_attn, scale_attn, shift_ffn, scale_ffn = self.time_mod(time_emb).chunk(4, dim=-1)
-
-        h = self.norm_attn(x)
-        h = modulate(h, shift_attn, scale_attn)
-        attn_out, _ = self.attn(
-            h,
-            h,
-            h,
-            key_padding_mask=key_padding_mask,
-            need_weights=False,
+        batch, length, hidden = x.shape
+        qkv = self.qkv(x).view(batch, length, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4)
+        q = rope(self.q_norm(q))
+        k = rope(self.k_norm(k))
+        mask = None
+        if attention_mask is not None:
+            mask = attention_mask[:, None, None, :].bool()
+        output = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=mask,
+            dropout_p=self.dropout if self.training else 0.0,
         )
-        x = x + attn_out
+        output = output.transpose(1, 2).reshape(batch, length, hidden)
+        return self.out(output)
 
-        h = self.norm_ffn(x)
-        h = modulate(h, shift_ffn, scale_ffn)
-        x = x + self.ffn(h)
+
+class SwiGLU(nn.Module):
+    def __init__(self, hidden_size: int, mlp_ratio: float, dropout: float) -> None:
+        super().__init__()
+        inner_size = int(hidden_size * mlp_ratio * 2.0 / 3.0)
+        self.input = _init_linear(nn.Linear(hidden_size, 2 * inner_size))
+        self.output = _init_linear(nn.Linear(inner_size, hidden_size))
+        self.dropout = dropout
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate, value = self.input(x).chunk(2, dim=-1)
+        x = F.silu(gate) * value
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        return self.output(x)
+
+
+class ELFBlock(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        mlp_ratio: float,
+        dropout: float,
+        eps: float,
+    ) -> None:
+        super().__init__()
+        self.norm1 = RMSNorm(hidden_size, eps)
+        self.attention = Attention(hidden_size, num_heads, dropout)
+        self.norm2 = RMSNorm(hidden_size, eps)
+        self.mlp = SwiGLU(hidden_size, mlp_ratio, dropout)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        rope: RotaryEmbedding,
+        attention_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        x = x + self.attention(self.norm1(x), rope, attention_mask)
+        x = x + self.mlp(self.norm2(x))
         return x
 
 
-def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    return x * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+class FinalLayer(nn.Module):
+    def __init__(self, hidden_size: int, output_size: int, eps: float) -> None:
+        super().__init__()
+        self.norm = RMSNorm(hidden_size, eps)
+        self.linear = _init_linear(nn.Linear(hidden_size, output_size), zero=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(self.norm(x))

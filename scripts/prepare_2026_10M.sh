@@ -2,5 +2,5 @@
 set -euo pipefail
 
 python -m babylm_elf.cli.prepare_data \
-  --config configs/babylm2025_elf_base.yml \
+  --config configs/2026_10M_adamW.yml \
   --train_tokenizer
