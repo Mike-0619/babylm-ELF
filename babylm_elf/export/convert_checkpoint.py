@@ -34,10 +34,10 @@ def export_checkpoint_to_hf(
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     model_state = checkpoint.get("model", checkpoint)
-    safe_state = {
+    safe_state = _dedupe_shared_tensors({
         name: tensor.detach().contiguous()
         for name, tensor in _hf_model_state(model_state).items()
-    }
+    })
     save_file(safe_state, output_dir / "model.safetensors")
     legacy_weights = output_dir / "pytorch_model.bin"
     if legacy_weights.exists():
@@ -75,15 +75,20 @@ def export_checkpoint_to_hf(
         "babylm_elf_config": model_config,
         "diffusion_config": _diffusion_config(checkpoint_config, config),
         "evaluation_config": {
-            "adapter": "continuous_noise_pseudo_likelihood",
-            "mc_samples": 4,
+            "backend": "mlm",
+            "adapter": "mlm_direct",
+            "mc_samples": 1,
             "seed": config.seed,
         },
         "diagnostic_generation_config": _diagnostic_generation_config(
             checkpoint_config,
             config,
         ),
-        "training_metadata": _training_metadata(checkpoint_config, config),
+        "training_metadata": _training_metadata(
+            checkpoint_config,
+            config,
+            checkpoint.get("metadata", {}) if isinstance(checkpoint, dict) else {},
+        ),
     }
     (output_dir / "config.json").write_text(json.dumps(hf_config, indent=2), encoding="utf-8")
 
@@ -105,10 +110,23 @@ def _model_config(
     vocab_size = _infer_vocab_size(model_state)
     if vocab_size is not None:
         model_config["vocab_size"] = vocab_size
+        if model_config.get("embedding_source") == "scratch_t5_encoder":
+            model_config["base_vocab_size"] = vocab_size
+            model_config["sentinel_start_id"] = vocab_size
+            model_config["encoder_vocab_size"] = vocab_size + int(
+                model_config.get("sentinel_count", 100)
+            )
+    if model_config.get("embedding_source") == "scratch_t5_encoder":
+        model_config["encoder_checkpoint_path"] = None
+        model_config["latent_stats_path"] = None
     return model_config
 
 
-def _training_metadata(checkpoint_config: Any, config: TrainConfig) -> dict[str, Any]:
+def _training_metadata(
+    checkpoint_config: Any,
+    config: TrainConfig,
+    checkpoint_metadata: dict[str, Any],
+) -> dict[str, Any]:
     if isinstance(checkpoint_config, dict):
         data_config = checkpoint_config.get("data", {})
         return {
@@ -117,6 +135,11 @@ def _training_metadata(checkpoint_config: Any, config: TrainConfig) -> dict[str,
             "train_path": str(data_config.get("train_path", config.data.train_path)),
             "valid_path": str(data_config.get("valid_path", config.data.valid_path)),
             "max_steps": checkpoint_config.get("max_steps", config.max_steps),
+            "word_exposure_offset": checkpoint_config.get(
+                "word_exposure_offset",
+                config.word_exposure_offset,
+            ),
+            "checkpoint_metadata": dict(checkpoint_metadata),
         }
     return {
         "name": config.name,
@@ -124,6 +147,8 @@ def _training_metadata(checkpoint_config: Any, config: TrainConfig) -> dict[str,
         "train_path": str(config.data.train_path),
         "valid_path": str(config.data.valid_path),
         "max_steps": config.max_steps,
+        "word_exposure_offset": config.word_exposure_offset,
+        "checkpoint_metadata": dict(checkpoint_metadata),
     }
 
 
@@ -151,6 +176,17 @@ def _diagnostic_generation_config(
 
 
 def _infer_vocab_size(model_state: dict[str, torch.Tensor]) -> int | None:
+    for key in (
+        "unembed_kernel",
+        "babylm_elf.unembed_kernel",
+    ):
+        weight = model_state.get(key)
+        if weight is not None:
+            return int(weight.shape[1])
+    for key in ("decoder_bias", "babylm_elf.decoder_bias"):
+        bias = model_state.get(key)
+        if bias is not None:
+            return int(bias.shape[0])
     for key in ("token_embedding.weight", "babylm_elf.token_embedding.weight"):
         weight = model_state.get(key)
         if weight is not None:
@@ -164,12 +200,52 @@ def _hf_model_state(model_state: dict[str, torch.Tensor]) -> dict[str, torch.Ten
     return {f"babylm_elf.{key}": value for key, value in model_state.items()}
 
 
+def _dedupe_shared_tensors(
+    model_state: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    deduped: dict[str, torch.Tensor] = {}
+    seen: dict[tuple[int, int, tuple[int, ...], tuple[int, ...]], str] = {}
+    for name, tensor in model_state.items():
+        storage_key = (
+            tensor.untyped_storage().data_ptr(),
+            tensor.storage_offset(),
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+        )
+        existing_name = seen.get(storage_key)
+        if existing_name is not None:
+            if _prefer_shared_tensor_name(name, existing_name):
+                deduped.pop(existing_name)
+                deduped[name] = tensor
+                seen[storage_key] = name
+            continue
+        seen[storage_key] = name
+        deduped[name] = tensor
+    return deduped
+
+
+def _prefer_shared_tensor_name(candidate: str, current: str) -> bool:
+    if candidate.endswith(".encoder.embed_tokens.weight") and current.endswith(".shared.weight"):
+        return True
+    return False
+
+
 def _write_tokenizer_metadata(
     tokenizer_path: Path,
     output_dir: Path,
     model_max_length: int,
 ) -> dict[str, int]:
     tokenizer = Tokenizer.from_file(str(tokenizer_path))
+    extra_ids = [
+        token
+        for token in (f"<extra_id_{index}>" for index in range(100))
+        if tokenizer.token_to_id(token) is not None
+    ]
+    if extra_ids:
+        raise ValueError(
+            "Exported BabyLM-ELF tokenizer must not contain T5 extra_id tokens: "
+            f"{', '.join(extra_ids[:5])}"
+        )
     token_ids: dict[str, int] = {}
     for role, token in SPECIAL_TOKENS.items():
         token_id = tokenizer.token_to_id(token)

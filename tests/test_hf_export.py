@@ -6,7 +6,15 @@ from tempfile import TemporaryDirectory
 import unittest
 
 import torch
-from transformers import AutoConfig, AutoModel, AutoModelForMaskedLM, AutoTokenizer
+try:
+    from transformers import AutoConfig, AutoModel, AutoModelForMaskedLM, AutoTokenizer
+except ModuleNotFoundError as exc:
+    if exc.name != "transformers":
+        raise
+    AutoConfig = None
+    AutoModel = None
+    AutoModelForMaskedLM = None
+    AutoTokenizer = None
 
 from babylm_elf.cli.export_hf import export_all_revisions
 from babylm_elf.config import DataConfig, DiffusionConfig, TrainConfig
@@ -14,7 +22,119 @@ from babylm_elf.export.convert_checkpoint import export_checkpoint_to_hf
 from babylm_elf.modeling.model import BabyLMELF, BabyLMELFConfig
 
 
+@unittest.skipIf(AutoConfig is None, "transformers is not installed")
 class HuggingFaceExportTest(unittest.TestCase):
+    def test_export_supports_scratch_encoder_mlm_backend(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        tokenizer_path = project_root / "data/smoke/tokenizer/tokenizer.json"
+        model_config = BabyLMELFConfig(
+            vocab_size=384,
+            base_vocab_size=384,
+            embedding_size=16,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            max_position_embeddings=32,
+            bottleneck_size=8,
+            embedding_source="scratch_t5_encoder",
+            encoder_vocab_size=484,
+            sentinel_start_id=384,
+            sentinel_count=100,
+            encoder_d_ff=32,
+            encoder_d_kv=4,
+            encoder_num_layers=1,
+            encoder_num_heads=4,
+            encoder_dropout_rate=0.0,
+        )
+        config = TrainConfig(
+            name="scratch_export_test",
+            word_exposure_offset=30_000_000,
+            model=model_config,
+            data=DataConfig(
+                tokenizer_path=str(tokenizer_path),
+                tokenizer_vocab_size=384,
+                seq_length=16,
+            ),
+            diffusion=DiffusionConfig(decoder_noise_scale=5.0),
+        )
+        model = BabyLMELF(model_config)
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint_path = root / "checkpoint.pt"
+            export_dir = root / "hf"
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "metadata": {
+                        "words_seen": 100_000_000,
+                        "target_words": 100_000_000,
+                    },
+                },
+                checkpoint_path,
+            )
+            export_checkpoint_to_hf(checkpoint_path, export_dir, config)
+
+            exported_config = json.loads(
+                (export_dir / "config.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(exported_config["evaluation_config"]["backend"], "mlm")
+            self.assertEqual(exported_config["evaluation_config"]["adapter"], "mlm_direct")
+            self.assertEqual(exported_config["evaluation_config"]["mc_samples"], 1)
+            self.assertEqual(
+                exported_config["babylm_elf_config"]["embedding_source"],
+                "scratch_t5_encoder",
+            )
+            self.assertIsNone(
+                exported_config["babylm_elf_config"]["encoder_checkpoint_path"]
+            )
+            self.assertIsNone(exported_config["babylm_elf_config"]["latent_stats_path"])
+            self.assertEqual(exported_config["vocab_size"], 384)
+            self.assertEqual(
+                exported_config["training_metadata"]["word_exposure_offset"],
+                30_000_000,
+            )
+            self.assertEqual(
+                exported_config["training_metadata"]["checkpoint_metadata"]["words_seen"],
+                100_000_000,
+            )
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                export_dir,
+                trust_remote_code=True,
+            )
+            input_ids = torch.tensor([[1, 7, tokenizer.mask_token_id, 2]])
+            attention_mask = torch.ones_like(input_ids)
+
+            encoder = AutoModel.from_pretrained(
+                export_dir,
+                trust_remote_code=True,
+            )
+            hidden = encoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            ).last_hidden_state
+            self.assertEqual(tuple(hidden.shape), (1, 4, 32))
+            self.assertTrue(torch.isfinite(hidden).all())
+            self.assertTrue(
+                all(
+                    not parameter.requires_grad
+                    for parameter in encoder.babylm_elf.scratch_encoder.parameters()
+                )
+            )
+
+            masked_lm = AutoModelForMaskedLM.from_pretrained(
+                export_dir,
+                trust_remote_code=True,
+            )
+            logits = masked_lm(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            ).logits
+            self.assertEqual(tuple(logits.shape), (1, 4, 384))
+            self.assertTrue(torch.isfinite(logits).all())
+
     def test_export_supports_babylm_encoder_and_mlm_interfaces(self) -> None:
         project_root = Path(__file__).resolve().parents[1]
         tokenizer_path = project_root / "data/smoke/tokenizer/tokenizer.json"
@@ -152,13 +272,8 @@ class HuggingFaceExportTest(unittest.TestCase):
                 attention_mask=attention_mask,
             ).logits
             self.assertEqual(tuple(first.shape), (1, 4, 384))
+            self.assertTrue(torch.isfinite(first).all())
             torch.testing.assert_close(first, second)
-            torch.testing.assert_close(
-                first[:, 2].float().logsumexp(dim=-1),
-                torch.zeros(1),
-                atol=1.0e-5,
-                rtol=1.0e-5,
-            )
             labels = torch.full_like(masked_ids, -100)
             labels[:, 2] = input_ids[:, 2]
             loss = masked_lm(
@@ -208,7 +323,7 @@ class HuggingFaceExportTest(unittest.TestCase):
             )
             revisions_dir = root / "revisions"
             export_all_revisions(run_dir, revisions_dir, config)
-            self.assertTrue((revisions_dir / "main/model.safetensors").exists())
+            self.assertTrue((revisions_dir / "hf_export_test_hf/model.safetensors").exists())
             self.assertTrue((revisions_dir / "chck_1M/model.safetensors").exists())
             self.assertTrue((revisions_dir / "chck_2M/model.safetensors").exists())
 

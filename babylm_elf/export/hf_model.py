@@ -23,6 +23,9 @@ class BabyLMELFHFModel(PreTrainedModel):
     base_model_prefix = "babylm_elf"
     _tied_weights_keys: list[str] = []
     all_tied_weights_keys: dict[str, list[str]] = {}
+    _keys_to_ignore_on_load_missing = [
+        r"babylm_elf\.scratch_encoder\.shared\.weight",
+    ]
     _supports_assign_param_buffer = False
 
     def __init__(self, config: BabyLMELFHFConfig):
@@ -30,15 +33,24 @@ class BabyLMELFHFModel(PreTrainedModel):
         model_config = BabyLMELFConfig(**config.babylm_elf_config)
         self.babylm_elf = BabyLMELF(model_config)
 
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        model = super().from_pretrained(*args, **kwargs)
+        model.babylm_elf._freeze_scratch_encoder()
+        return model
+
     def get_input_embeddings(self):
         return self.babylm_elf.token_embedding
 
     def set_input_embeddings(self, value):
+        if self.babylm_elf.token_embedding is None:
+            raise ValueError("Scratch-encoder BabyLM-ELF does not expose input embeddings.")
         self.babylm_elf.token_embedding = value
 
     def tie_weights(self, *args, **kwargs):
         result = super().tie_weights(*args, **kwargs)
         self.babylm_elf.rope.reset_buffers()
+        self.babylm_elf._freeze_scratch_encoder()
         return result
 
     def _decoder_hidden(
@@ -75,7 +87,10 @@ class BabyLMELFHFModel(PreTrainedModel):
         if z_t is None:
             if input_ids is None:
                 raise ValueError("Provide either input_ids or z_t.")
-            z_t = self.babylm_elf.embed_tokens(input_ids)
+            z_t = self.babylm_elf.embed_tokens(
+                input_ids,
+                attention_mask=attention_mask,
+            )
         elif t is None:
             raise ValueError("Provide t when passing z_t directly.")
 
@@ -86,45 +101,7 @@ class BabyLMELFHFModel(PreTrainedModel):
 
 
 class BabyLMELFForMaskedLM(BabyLMELFHFModel):
-    """Continuous-noise pseudo-likelihood adapter for BabyLM MLM evaluation."""
-
-    def _mask_positions(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor | None,
-    ) -> torch.Tensor:
-        mask_token_id = getattr(self.config, "mask_token_id", None)
-        if mask_token_id is None:
-            raise ValueError("The exported tokenizer/config must define mask_token_id.")
-        mask = input_ids.eq(mask_token_id)
-        if attention_mask is not None:
-            mask = mask & attention_mask.bool()
-        return mask
-
-    def _continuous_noised_embeddings(
-        self,
-        clean_embeddings: torch.Tensor,
-        mask_positions: torch.Tensor,
-        sample_index: int,
-    ) -> torch.Tensor:
-        evaluation = self.config.evaluation_config
-        seed = int(evaluation.get("seed", 42)) + sample_index
-        generator = torch.Generator(device=clean_embeddings.device)
-        generator.manual_seed(seed)
-        noise = torch.randn(
-            clean_embeddings.shape,
-            generator=generator,
-            device=clean_embeddings.device,
-            dtype=clean_embeddings.dtype,
-        )
-        noise_scale = float(
-            self.config.diffusion_config.get("decoder_noise_scale", 5.0)
-        )
-        return torch.where(
-            mask_positions.unsqueeze(-1),
-            noise * noise_scale,
-            clean_embeddings,
-        )
+    """Direct masked-token adapter for BabyLM MLM evaluation."""
 
     def forward(
         self,
@@ -143,27 +120,12 @@ class BabyLMELFForMaskedLM(BabyLMELFHFModel):
             hidden = self._decoder_hidden(z_t, attention_mask, t)
             logits = self._decode_hidden(hidden)
         else:
-            clean_embeddings = self.babylm_elf.embed_tokens(input_ids)
-            mask_positions = self._mask_positions(input_ids, attention_mask)
-            sample_count = max(
-                1, int(self.config.evaluation_config.get("mc_samples", 4))
+            embeddings = self.babylm_elf.embed_tokens(
+                input_ids,
+                attention_mask=attention_mask,
             )
-            if mask_positions.any():
-                probabilities = []
-                for sample_index in range(sample_count):
-                    z_sample = self._continuous_noised_embeddings(
-                        clean_embeddings,
-                        mask_positions,
-                        sample_index,
-                    )
-                    hidden = self._decoder_hidden(z_sample, attention_mask)
-                    probabilities.append(
-                        self._decode_hidden(hidden).float().softmax(dim=-1)
-                    )
-                logits = torch.stack(probabilities).mean(dim=0).clamp_min(1.0e-12).log()
-            else:
-                hidden = self._decoder_hidden(clean_embeddings, attention_mask, t)
-                logits = self._decode_hidden(hidden)
+            hidden = self._decoder_hidden(embeddings, attention_mask, t)
+            logits = self._decode_hidden(hidden)
 
         loss = None
         if labels is not None:
@@ -178,15 +140,7 @@ class BabyLMELFForMaskedLM(BabyLMELFHFModel):
         return MaskedLMOutput(loss=loss, logits=logits)
 
     def _decode_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
-        with torch.autocast(device_type=hidden.device.type, enabled=False):
-            decoder_hidden = F.gelu(
-                self.babylm_elf.decoder_projection(hidden.float()),
-                approximate="tanh",
-            )
-            return (
-                decoder_hidden @ self.babylm_elf.normalized_embedding_weight().T
-                + self.babylm_elf.decoder_bias
-            )
+        return self.babylm_elf.decode_hidden(hidden)
 
     @torch.no_grad()
     def generate(

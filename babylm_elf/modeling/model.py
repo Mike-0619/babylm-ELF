@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -19,6 +20,7 @@ from .layers import (
 @dataclass
 class BabyLMELFConfig:
     vocab_size: int = 16384
+    base_vocab_size: int = 16384
     embedding_size: int = 512
     hidden_size: int = 768
     intermediate_size: int = 3072
@@ -32,20 +34,50 @@ class BabyLMELFConfig:
     num_self_cond_cfg_tokens: int = 4
     num_model_mode_tokens: int = 4
     pad_token_id: int = 3
+    mask_token_id: int = 4
     embedding_rms: float = 1.0
+    embedding_source: str = "learnable"
+    encoder_checkpoint_path: str | None = None
+    latent_stats_path: str | None = None
+    encoder_vocab_size: int = 16484
+    sentinel_start_id: int = 16384
+    sentinel_count: int = 100
+    encoder_d_ff: int = 2048
+    encoder_d_kv: int = 64
+    encoder_num_layers: int = 6
+    encoder_num_heads: int = 8
+    encoder_dropout_rate: float = 0.1
 
 
 class BabyLMELF(nn.Module):
-    """BabyLM-compliant ELF-B using the paper's learnable-embedding variant."""
+    """BabyLM-compliant ELF-B with learnable or frozen scratch-encoder embeddings."""
 
     def __init__(self, config: BabyLMELFConfig) -> None:
         super().__init__()
         self.config = config
-        self.token_embedding = nn.Embedding(
-            config.vocab_size,
-            config.embedding_size,
-            padding_idx=config.pad_token_id,
+        if config.embedding_source not in {"learnable", "scratch_t5_encoder"}:
+            raise ValueError(
+                "embedding_source must be 'learnable' or 'scratch_t5_encoder', "
+                f"got {config.embedding_source!r}"
+            )
+        self.token_embedding = (
+            nn.Embedding(
+                config.vocab_size,
+                config.embedding_size,
+                padding_idx=config.pad_token_id,
+            )
+            if config.embedding_source == "learnable"
+            else None
         )
+        self.scratch_encoder = (
+            self._build_scratch_encoder(config)
+            if config.embedding_source == "scratch_t5_encoder"
+            else None
+        )
+        latent_mean = torch.zeros(config.embedding_size, dtype=torch.float32)
+        latent_std = torch.ones(config.embedding_size, dtype=torch.float32)
+        self.register_buffer("latent_mean", latent_mean)
+        self.register_buffer("latent_std", latent_std)
         self.self_cond_projection = nn.Linear(2 * config.embedding_size, config.embedding_size)
         self.text_projection = BottleneckProjection(
             config.embedding_size,
@@ -93,23 +125,46 @@ class BabyLMELF(nn.Module):
             config.layer_norm_eps,
         )
         self.decoder_projection = nn.Linear(config.hidden_size, config.embedding_size)
+        self.unembed_kernel = (
+            nn.Parameter(torch.empty(config.embedding_size, config.base_vocab_size))
+            if config.embedding_source == "scratch_t5_encoder"
+            else None
+        )
         self.decoder_bias = nn.Parameter(torch.zeros(config.vocab_size))
         self.reset_parameters()
+        self._load_scratch_encoder_if_configured()
+        self._load_latent_stats_if_configured()
+        self._freeze_scratch_encoder()
 
     def reset_parameters(self) -> None:
-        nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
+        if self.token_embedding is not None:
+            nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
         nn.init.xavier_uniform_(self.self_cond_projection.weight)
         nn.init.zeros_(self.self_cond_projection.bias)
         nn.init.xavier_uniform_(self.decoder_projection.weight)
         nn.init.zeros_(self.decoder_projection.bias)
+        if self.unembed_kernel is not None:
+            nn.init.xavier_uniform_(self.unembed_kernel)
         nn.init.normal_(self.time_tokens, mean=0.0, std=0.02)
         nn.init.normal_(self.self_cond_cfg_tokens, mean=0.0, std=0.02)
         nn.init.normal_(self.mode_tokens, mean=0.0, std=0.02)
-        if self.config.pad_token_id is not None:
+        if self.token_embedding is not None and self.config.pad_token_id is not None:
             with torch.no_grad():
                 self.token_embedding.weight[self.config.pad_token_id].zero_()
 
-    def embed_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
+    @property
+    def embedding_dtype(self) -> torch.dtype:
+        return self.decoder_projection.weight.dtype
+
+    def embed_tokens(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.config.embedding_source == "scratch_t5_encoder":
+            return self._embed_with_scratch_encoder(input_ids, attention_mask)
+        if self.token_embedding is None:
+            raise RuntimeError("Learnable token embedding is not initialized.")
         embeddings = F.normalize(
             self.token_embedding(input_ids).float(),
             dim=-1,
@@ -117,7 +172,19 @@ class BabyLMELF(nn.Module):
         return embeddings * (math.sqrt(self.config.embedding_size) * self.config.embedding_rms)
 
     def normalized_embedding_weight(self) -> torch.Tensor:
+        if self.token_embedding is None:
+            raise RuntimeError("Scratch encoder mode uses independent unembedding.")
         return F.normalize(self.token_embedding.weight.float(), dim=-1)
+
+    def decode_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
+        with torch.autocast(device_type=hidden.device.type, enabled=False):
+            decoder_hidden = F.gelu(
+                self.decoder_projection(hidden.float()),
+                approximate="tanh",
+            )
+            if self.unembed_kernel is not None:
+                return decoder_hidden @ self.unembed_kernel.float() + self.decoder_bias
+            return decoder_hidden @ self.normalized_embedding_weight().T + self.decoder_bias
 
     def build_context(
         self,
@@ -148,11 +215,7 @@ class BabyLMELF(nn.Module):
         )
         with torch.autocast(device_type=x.device.type, enabled=False):
             prediction = self.flow_head(hidden.float())
-            decoder_hidden = F.gelu(
-                self.decoder_projection(hidden.float()),
-                approximate="tanh",
-            )
-            logits = decoder_hidden @ self.normalized_embedding_weight().T + self.decoder_bias
+            logits = self.decode_hidden(hidden)
         return prediction, logits
 
     def forward_hidden(
@@ -216,4 +279,129 @@ class BabyLMELF(nn.Module):
         return prediction
 
     def decode_embeddings(self, embeddings: torch.Tensor) -> torch.Tensor:
+        if self.unembed_kernel is not None:
+            return embeddings.float() @ self.unembed_kernel.float() + self.decoder_bias
         return embeddings.float() @ self.normalized_embedding_weight().T + self.decoder_bias
+
+    def _build_scratch_encoder(self, config: BabyLMELFConfig) -> T5EncoderModel:
+        from transformers import T5Config, T5EncoderModel
+
+        t5_config = T5Config(
+            vocab_size=config.encoder_vocab_size,
+            d_model=config.embedding_size,
+            d_ff=config.encoder_d_ff,
+            d_kv=config.encoder_d_kv,
+            num_layers=config.encoder_num_layers,
+            num_decoder_layers=config.encoder_num_layers,
+            num_heads=config.encoder_num_heads,
+            dropout_rate=config.encoder_dropout_rate,
+            layer_norm_epsilon=config.layer_norm_eps,
+            feed_forward_proj="relu",
+            pad_token_id=config.pad_token_id,
+            eos_token_id=2,
+            decoder_start_token_id=config.pad_token_id,
+        )
+        return T5EncoderModel(t5_config)
+
+    def _load_scratch_encoder_if_configured(self) -> None:
+        if self.scratch_encoder is None or not self.config.encoder_checkpoint_path:
+            return
+        checkpoint_path = Path(self.config.encoder_checkpoint_path)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Scratch encoder checkpoint not found: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        state = checkpoint.get("encoder", checkpoint.get("model", checkpoint))
+        try:
+            self.scratch_encoder.load_state_dict(state)
+        except RuntimeError:
+            encoder_state = _strip_prefix_if_present(state, "encoder.")
+            self.scratch_encoder.encoder.load_state_dict(encoder_state)
+
+    def _load_latent_stats_if_configured(self) -> None:
+        if self.config.embedding_source != "scratch_t5_encoder" or not self.config.latent_stats_path:
+            return
+        stats_path = Path(self.config.latent_stats_path)
+        if not stats_path.exists():
+            raise FileNotFoundError(f"Scratch encoder latent stats not found: {stats_path}")
+        stats = torch.load(stats_path, map_location="cpu", weights_only=True)
+        mean = stats["mean"].float()
+        std = stats["std"].float().clamp_min(1.0e-6)
+        if mean.shape != self.latent_mean.shape or std.shape != self.latent_std.shape:
+            raise ValueError(
+                "Latent stats shape mismatch: expected "
+                f"{tuple(self.latent_mean.shape)}, got mean={tuple(mean.shape)}, "
+                f"std={tuple(std.shape)}"
+            )
+        self.latent_mean.copy_(mean)
+        self.latent_std.copy_(std)
+
+    def _freeze_scratch_encoder(self) -> None:
+        if self.scratch_encoder is None:
+            return
+        self.scratch_encoder.eval()
+        for parameter in self.scratch_encoder.parameters():
+            parameter.requires_grad_(False)
+
+    def _embed_with_scratch_encoder(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.scratch_encoder is None:
+            raise RuntimeError("Scratch encoder is not initialized.")
+        if attention_mask is None:
+            attention_mask = input_ids.ne(self.config.pad_token_id).to(torch.long)
+        encoder_ids = self._replace_mask_spans_with_sentinels(input_ids, attention_mask)
+        was_training = self.scratch_encoder.training
+        self.scratch_encoder.eval()
+        try:
+            with torch.no_grad():
+                outputs = self.scratch_encoder(
+                    input_ids=encoder_ids,
+                    attention_mask=attention_mask,
+                ).last_hidden_state
+        finally:
+            if was_training:
+                self.scratch_encoder.train()
+        normalized = (outputs.float() - self.latent_mean) / self.latent_std.clamp_min(1.0e-6)
+        return normalized.to(dtype=self.embedding_dtype)
+
+    def _replace_mask_spans_with_sentinels(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.config.mask_token_id is None:
+            return input_ids
+        mapped = input_ids.clone()
+        mask_positions = input_ids.eq(self.config.mask_token_id) & attention_mask.bool()
+        for batch_idx in range(input_ids.size(0)):
+            sentinel_offset = 0
+            in_span = False
+            for token_idx in range(input_ids.size(1)):
+                if not bool(mask_positions[batch_idx, token_idx]):
+                    in_span = False
+                    continue
+                if not in_span:
+                    mapped[batch_idx, token_idx] = min(
+                        self.config.sentinel_start_id + sentinel_offset,
+                        self.config.sentinel_start_id + self.config.sentinel_count - 1,
+                    )
+                    sentinel_offset += 1
+                    in_span = True
+                else:
+                    mapped[batch_idx, token_idx] = mapped[batch_idx, token_idx - 1]
+        return mapped
+
+
+def _strip_prefix_if_present(
+    state: dict[str, torch.Tensor],
+    prefix: str,
+) -> dict[str, torch.Tensor]:
+    if not any(key.startswith(prefix) for key in state):
+        return state
+    return {
+        key.removeprefix(prefix): value
+        for key, value in state.items()
+        if key.startswith(prefix)
+    }

@@ -29,10 +29,15 @@ def train_from_config(config: TrainConfig) -> None:
     device = resolve_device(config.device)
 
     tokenizer = load_tokenizer(config.data.tokenizer_path)
-    config.model.vocab_size = tokenizer.get_vocab_size()
+    base_vocab_size = tokenizer.get_vocab_size()
+    config.model.vocab_size = base_vocab_size
+    config.model.base_vocab_size = base_vocab_size
+    config.model.sentinel_start_id = base_vocab_size
+    config.model.encoder_vocab_size = base_vocab_size + config.model.sentinel_count
     pad_token_id = tokenizer.token_to_id("<pad>")
     if pad_token_id is not None:
         config.model.pad_token_id = pad_token_id
+    _validate_embedding_source(config)
 
     train_generator = torch.Generator()
     train_loader = build_dataloader(
@@ -316,6 +321,21 @@ def _count_actual_train_words(config: TrainConfig) -> int | None:
             f"{actual_word_count:,} cleaned whitespace words"
         )
     return actual_word_count
+
+
+def _validate_embedding_source(config: TrainConfig) -> None:
+    if config.model.embedding_source != "scratch_t5_encoder":
+        return
+    if not config.model.encoder_checkpoint_path:
+        raise ValueError("scratch_t5_encoder requires model.encoder_checkpoint_path.")
+    encoder_checkpoint = Path(config.model.encoder_checkpoint_path)
+    if not encoder_checkpoint.exists():
+        raise FileNotFoundError(f"Scratch encoder checkpoint not found: {encoder_checkpoint}")
+    if not config.model.latent_stats_path:
+        raise ValueError("scratch_t5_encoder requires model.latent_stats_path.")
+    latent_stats = Path(config.model.latent_stats_path)
+    if not latent_stats.exists():
+        raise FileNotFoundError(f"Scratch encoder latent stats not found: {latent_stats}")
 
 
 def _next_group_size(

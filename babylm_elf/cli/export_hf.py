@@ -17,7 +17,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--all-revisions",
         action="store_true",
-        help="Export main plus every BabyLM chck_*M checkpoint into revision directories.",
+        help="Export <run_name>_hf plus every BabyLM chck_*M checkpoint into revision directories.",
     )
     return parser.parse_args()
 
@@ -43,7 +43,11 @@ def export_all_revisions(run_dir: Path, output_root: Path, config) -> None:
     main_checkpoint = (
         final_checkpoint if final_checkpoint.exists() else default_checkpoint(run_dir)
     )
-    export_checkpoint_to_hf(main_checkpoint, output_root / "main", config)
+    export_checkpoint_to_hf(
+        main_checkpoint,
+        output_root / _main_export_name(config),
+        config,
+    )
     required_dir = run_dir / "checkpoints" / "babylm_required"
     checkpoints = sorted(required_dir.glob("chck_*M.pt"), key=_checkpoint_exposure)
     if not checkpoints:
@@ -80,6 +84,11 @@ def _checkpoint_exposure(path: Path) -> int:
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     metadata = checkpoint.get("metadata", {}) if isinstance(checkpoint, dict) else {}
     return int(metadata.get("target_words", metadata.get("words_seen", 0)))
+
+
+def _main_export_name(config) -> str:
+    name = getattr(config, "name", "model") or "model"
+    return f"{name}_hf"
 
 
 if __name__ == "__main__":

@@ -1,0 +1,63 @@
+name: encoder
+seed: 42
+output_dir: outputs/2026_10M/encoder
+epochs: 3
+batch_size: 8
+gradient_accumulation_steps: 8
+log_every: 50
+mixed_precision: true
+device: auto
+
+data:
+  source: huggingface
+  hf_dataset: BabyLM-community/BabyLM-2026-Strict-Small
+  hf_config: null
+  hf_train_split: train
+  hf_valid_split: null
+  hf_text_field: text
+  train_text: data/2026_10M/raw/train_10M.txt
+  valid_text: null
+  train_path: data/2026_10M/tokenized/train_10M.bin
+  valid_path: null
+  tokenizer_path: data/2026_10M/tokenizer/tokenizer.json
+  tokenizer_vocab_size: 16384
+  seq_length: 512
+  num_workers: 0
+  train_word_count: 10000000
+
+model:
+  base_vocab_size: 16384
+  sentinel_start_id: 16384
+  sentinel_count: 100
+  vocab_size: 16484
+  d_model: 512
+  d_ff: 2048
+  d_kv: 64
+  num_layers: 6
+  num_decoder_layers: 6
+  num_heads: 8
+  dropout_rate: 0.1
+  layer_norm_epsilon: 0.000001
+  pad_token_id: 3
+  eos_token_id: 2
+  decoder_start_token_id: 3
+
+objective:
+  objective: t5_span_corruption
+  noise_density: 0.15
+  mean_noise_span_length: 3.0
+  special_token_count: 16
+
+optim:
+  optimizer: adamw
+  learning_rate: 0.0005
+  weight_decay: 0.0
+  beta1: 0.9
+  beta2: 0.999
+  eps: 0.00000001
+  max_grad_norm: 1.0
+  warmup_steps: -1
+  warmup_epochs: 0.4
+  lr_schedule: cosine
+  min_lr: 0.0
+  ema_decay: 0.0

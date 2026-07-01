@@ -1,60 +1,43 @@
 # BabyLM ELF
 
-BabyLM Strict adaptation of Embedded Language Flows (ELF).
+BabyLM 2026 Strict/Strict-Small implementation of Embedded Language Flows
+with a from-scratch contextual encoder.
 
-The target implementation adapts ELF-style continuous diffusion to BabyLM
-Strict by replacing ELF's pretrained T5 latent encoder with a from-scratch BPE
-tokenizer and trainable token embeddings:
-
-```text
-token ids -> 512-d learnable embeddings -> 128-d bottleneck -> ELF-B
-          -> continuous x-prediction / final-step token decoding
-```
-
-The implementation follows the paper's mixed-batch objective:
+The main 2026 recipe is:
 
 ```text
-80% of examples: logit-normal flow matching with velocity-equivalent MSE
-20% of examples: t=1 token-level corruption with cross-entropy decoding
+16K BabyLM BPE ids
+-> scratch T5-small-style span-corruption encoder
+-> channel-wise normalized 512-d contextual latents
+-> ELF-B continuous flow model
+-> final-step MLM logits over the base 16K vocab
 ```
 
-It includes RMSNorm, RoPE, qk-norm, in-context time/CFG/mode tokens,
-50% self-conditioning, training-time self-conditioning CFG, Muon with
-auxiliary Nesterov-Adam, 0.5-epoch warmup, and EMA checkpoints.
+The tokenizer is trained only on the allowed BabyLM corpus. Exported tokenizer
+files do not contain T5 `<extra_id_*>` tokens. Encoder pretraining uses internal
+sentinel ids above the base vocab:
 
-The intentional departure from the paper's main OpenWebText experiment is the
-embedding encoder. BabyLM Strict cannot use pretrained T5-small, so this
-project uses the paper's learnable tied-embedding ablation rather than the
-paper's default pretrained contextual T5 latents. The single-GPU configs use
-effective batch 32 and linearly scale Muon's learning rate from `0.002` to
-`0.000125`. Learnable token embeddings are normalized to unit RMS before flow
-corruption so their scale is compatible with the configured noise scales.
+```text
+base_vocab_size = 16384
+sentinel_start_id = 16384
+sentinel_count = 100
+encoder_vocab_size = 16484
+```
 
-The exported Hugging Face model has two inference surfaces. Official BabyLM
-evaluation should use the MLM-compatible `forward()` adapter, which scores
-masked positions with continuous-noise pseudo-likelihood. Open-ended
-`generate()` runs ELF-style ODE/SDE sampling from Gaussian noise and is meant
-for diagnostics and qualitative examples, not as a replacement for the BabyLM
-official evaluation pipeline. Its default diagnostic settings are 64-step SDE,
-logit-normal time schedule, self-conditioning CFG scale 3, and gamma 1.
-
-The main model must not use pretrained T5/BERT/GPT/RoBERTa weights, pretrained
-T5 tokenizers, ELF pretrained checkpoints, or off-the-shelf learned language
-tools. Any learned ancillary language model or tool would count toward the
-BabyLM word-exposure budget.
+Encoder exposure counts toward the BabyLM 10-epoch budget. The default split is
+3 encoder epochs plus 7 ELF epochs.
 
 ## Layout
 
 ```text
-babylm_elf/cli/             prepare/train/export command-line entry points
-babylm_elf/data/            tokenizer, datasets, collation
-babylm_elf/modeling/        ELF-B model and layers
-babylm_elf/diffusion/       noising, schedules, target conversions
-babylm_elf/training/        trainer, step, losses, optimizer, checkpoints
-babylm_elf/export/          Hugging Face-compatible export helpers
-configs/                    2025, 2026, and smoke YAML configs
-scripts/                    thin prepare/train/export/SLURM wrappers
-paper/                      paper draft, figures, tables
+babylm_elf/cli/       prepare, encoder-train, ELF-train, HF-export entry points
+babylm_elf/encoder/   T5-style span corruption utilities
+babylm_elf/modeling/  ELF-B model with frozen scratch encoder mode
+babylm_elf/training/  trainer, optimizer, checkpoint exposure accounting
+babylm_elf/export/    Hugging Face remote-code export for AutoModel/MLM
+configs/              10M/100M encoder and scratch-ELF configs
+scripts/              thin local and SLURM wrappers
+tests/                tokenizer/span/encoder/export/accounting smoke tests
 ```
 
 ## Setup
@@ -64,79 +47,87 @@ conda activate babylm-elf
 pip install -r requirements.txt
 ```
 
-## Smoke Test
+PyTorch should match the cluster CUDA driver; see `requirements.txt`.
+
+## 10M Run
 
 ```bash
-scripts/smoke_test.sh
-```
-
-This generates a tiny toy tokenizer/dataset and runs two ELF training steps.
-
-Generated files are grouped by run name:
-
-```text
-data/smoke/{raw,tokenizer,tokenized}/
-outputs/smoke/checkpoints/
-outputs/smoke/hf/
-
-data/babylm2025/{raw,tokenizer,tokenized}/
-outputs/babylm2025/checkpoints/
-outputs/babylm2025/hf/
-
-data/2026_100M/{raw,tokenizer,tokenized}/
-outputs/2026_100M/{adamW,muon}/checkpoints/
-outputs/2026_100M/{adamW,muon}/hf/
-
-data/2026_10M/{raw,tokenizer,tokenized}/
-outputs/2026_10M/{adamW,muon}/checkpoints/
-outputs/2026_10M/{adamW,muon}/hf/
-```
-
-## Train
-
-Prepare year-specific Hugging Face data, tokenizer, and tokenized files first:
-
-```bash
-scripts/prepare_2025.sh
-scripts/prepare_2026_100M.sh
 scripts/prepare_2026_10M.sh
-```
-
-Then run:
-
-```bash
-scripts/train_2025.sh
-scripts/train_2026_100M.sh
+scripts/train_encoder_2026_10M.sh
 scripts/train_2026_10M.sh
-```
-
-or on SLURM:
-
-```bash
-sbatch scripts/slurm/train_2025.slurm
-sbatch scripts/slurm/train_2026_100M_adamW.slurm
-sbatch scripts/slurm/train_2026_10M_adamW.slurm
-```
-
-Official `chck_*M.pt` files are compact EMA model checkpoints. Checkpoint
-writes use a temporary file followed by atomic replacement, so an interrupted
-save cannot leave a partially written checkpoint at the final path.
-
-The official 2026 configs do not use evaluation data as training validation.
-Choose Muon learning rates by comparing BabyLM fast-evaluation results at the
-same word-exposure checkpoint, rather than by training loss alone.
-
-Export Hugging Face-compatible artifacts for the official BabyLM evaluation
-repositories:
-
-```bash
-scripts/export_2025_hf.sh
-scripts/export_2026_100M_hf.sh
 scripts/export_2026_10M_hf.sh
 ```
 
-The BabyLM 2025 Hugging Face dataset id is currently left as a placeholder, so
-the 2025 prepare script should be treated as inactive unless local 2025 text is
-placed under `data/babylm2025/raw/`. The 2026 100M config points to
-`BabyLM-community/BabyLM-2026-Strict`; the 2026 10M config points to
-`BabyLM-community/BabyLM-2026-Strict-Small`.
+On SLURM:
+
+```bash
+sbatch scripts/slurm/prepare_2026_10M.slurm
+sbatch scripts/slurm/train_encoder_2026_10M.slurm
+sbatch scripts/slurm/train_2026_10M.slurm
+bash scripts/slurm/export_2026_10M_hf.txt
+```
+
+## 100M Run
+
+```bash
+scripts/prepare_2026_100M.sh
+scripts/train_encoder_2026_100M.sh
+scripts/train_2026_100M.sh
+scripts/export_2026_100M_hf.sh
+```
+
+On SLURM:
+
+```bash
+sbatch scripts/slurm/prepare_2026_100M.slurm
+sbatch scripts/slurm/train_encoder_2026_100M.slurm
+sbatch scripts/slurm/train_2026_100M.slurm
+bash scripts/slurm/export_2026_100M_hf.txt
+```
+
+## Expected Artifacts
+
+```text
+data/2026_10M/tokenizer/tokenizer.json
+data/2026_10M/tokenized/train_10M.bin
+outputs/2026_10M/encoder/checkpoints/final.pt
+outputs/2026_10M/encoder/latent_stats.pt
+outputs/2026_10M/scratch_encoder_muon/checkpoints/babylm_required/chck_*M.pt
+outputs/2026_10M/scratch_encoder_muon/hf_revisions/
+outputs/2026_10M/scratch_encoder_muon/hf_revisions/scratch_encoder_muon_hf/
+
+data/2026_100M/tokenizer/tokenizer.json
+data/2026_100M/tokenized/train_100M.bin
+outputs/2026_100M/encoder/checkpoints/final.pt
+outputs/2026_100M/encoder/latent_stats.pt
+outputs/2026_100M/scratch_encoder_muon/checkpoints/babylm_required/chck_*M.pt
+outputs/2026_100M/scratch_encoder_muon/hf_revisions/
+outputs/2026_100M/scratch_encoder_muon/hf_revisions/scratch_encoder_muon_hf/
+```
+
+For 10M, checkpoint metadata reports total exposure as
+`30M encoder words + ELF words`, so required revisions start after the encoder
+offset. For 100M, the offset is `300M`.
+
+## Tests
+
+```bash
+python -m unittest discover tests
+```
+
+For Hugging Face remote-code tests on systems with a read-only home cache:
+
+```bash
+HF_HOME=/tmp/babylm-elf-hf-test \
+TRANSFORMERS_CACHE=/tmp/babylm-elf-hf-test/transformers \
+python -m unittest tests.test_hf_export
+```
+
+## Notes
+
+- Raw data preparation stays shared between 10M and 100M.
+- The official BabyLM backend should be `mlm`.
+- `AutoModel` returns `BaseModelOutput(last_hidden_state=...)`.
+- `AutoModelForMaskedLM` returns `MaskedLMOutput(logits=...)`.
+- The scratch encoder is frozen during ELF training and excluded from the
+  optimizer and EMA trainable shadow.

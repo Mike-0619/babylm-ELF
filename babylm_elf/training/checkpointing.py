@@ -23,6 +23,10 @@ class CheckpointManager:
         self.steps_per_epoch = steps_per_epoch
         self.microbatches_per_epoch = microbatches_per_epoch
         self.actual_train_word_count = actual_train_word_count
+        self.word_exposure_offset = max(
+            0,
+            int(getattr(config, "word_exposure_offset", 0) or 0),
+        )
         self.word_targets = _build_word_checkpoint_targets(
             config,
             steps_per_epoch,
@@ -117,6 +121,12 @@ class CheckpointManager:
             or ("babylm_word_exposure" if self.word_checkpoints_enabled else "step"),
             "words_seen": words_seen,
             "nominal_words_seen": words_seen,
+            "word_exposure_offset": self.word_exposure_offset,
+            "elf_words_seen": self._stage_words_seen_for_count(
+                self.config.data.train_word_count or 0,
+                step,
+                microbatches_seen,
+            ),
             "steps_per_epoch": self.steps_per_epoch,
         }
         if self.microbatches_per_epoch is not None:
@@ -128,22 +138,33 @@ class CheckpointManager:
                 {
                     "corpus_word_count": self.config.data.train_word_count,
                     "nominal_corpus_word_count": self.config.data.train_word_count,
-                    "epochs_completed": (
-                        microbatches_seen / self.microbatches_per_epoch
-                        if (
-                            microbatches_seen is not None
-                            and self.microbatches_per_epoch
-                        )
-                        else step / max(1, self.steps_per_epoch)
+                    "epochs_completed": words_seen / self.config.data.train_word_count,
+                    "elf_epochs_completed": self._stage_epochs_completed(
+                        step,
+                        microbatches_seen,
+                    ),
+                    "stage_epochs_completed": self._stage_epochs_completed(
+                        step,
+                        microbatches_seen,
                     ),
                     "exposure_unit": "whitespace_words",
                 }
             )
         if self.actual_train_word_count is not None:
+            actual_offset = self._actual_word_exposure_offset()
             metadata.update(
                 {
                     "actual_corpus_word_count": self.actual_train_word_count,
-                    "actual_words_seen": self._words_seen_for_count(
+                    "actual_word_exposure_offset": actual_offset,
+                    "actual_words_seen": (
+                        actual_offset
+                        + self._stage_words_seen_for_count(
+                            self.actual_train_word_count,
+                            step,
+                            microbatches_seen,
+                        )
+                    ),
+                    "elf_actual_words_seen": self._stage_words_seen_for_count(
                         self.actual_train_word_count,
                         step,
                         microbatches_seen,
@@ -163,9 +184,13 @@ class CheckpointManager:
         word_count = self.config.data.train_word_count
         if word_count is None:
             return 0
-        return self._words_seen_for_count(word_count, step, microbatches_seen)
+        return self.word_exposure_offset + self._stage_words_seen_for_count(
+            word_count,
+            step,
+            microbatches_seen,
+        )
 
-    def _words_seen_for_count(
+    def _stage_words_seen_for_count(
         self,
         word_count: int,
         step: int,
@@ -181,6 +206,23 @@ class CheckpointManager:
                 + within_epoch * word_count // self.microbatches_per_epoch
             )
         return (step * word_count) // max(1, self.steps_per_epoch)
+
+    def _stage_epochs_completed(
+        self,
+        step: int,
+        microbatches_seen: int | None = None,
+    ) -> float:
+        if microbatches_seen is not None and self.microbatches_per_epoch:
+            return microbatches_seen / self.microbatches_per_epoch
+        return step / max(1, self.steps_per_epoch)
+
+    def _actual_word_exposure_offset(self) -> int:
+        nominal_word_count = self.config.data.train_word_count
+        if not nominal_word_count or self.actual_train_word_count is None:
+            return self.word_exposure_offset
+        return (
+            self.word_exposure_offset * self.actual_train_word_count
+        ) // nominal_word_count
 
 
 def save_checkpoint(
@@ -239,11 +281,14 @@ def _build_word_checkpoint_targets(
         run_word_limit = (
             config.max_steps * config.data.train_word_count
         ) // max(1, steps_per_epoch)
+    word_exposure_offset = max(0, int(getattr(config, "word_exposure_offset", 0) or 0))
     competition_limit = config.data.train_word_count * 10
-    if run_word_limit > competition_limit:
+    total_run_word_limit = word_exposure_offset + run_word_limit
+    if total_run_word_limit > competition_limit:
         raise ValueError(
             "BabyLM competition runs may not exceed 10 epochs: "
-            f"configured exposure is {run_word_limit:,} words, limit is "
+            f"configured exposure is {total_run_word_limit:,} words "
+            f"({word_exposure_offset:,} offset + {run_word_limit:,} ELF), limit is "
             f"{competition_limit:,} words."
         )
 
@@ -253,7 +298,7 @@ def _build_word_checkpoint_targets(
             "checkpoint_word_limit exceeds the BabyLM 10-epoch exposure limit: "
             f"{word_limit:,} > {competition_limit:,}."
         )
-    word_limit = min(word_limit, run_word_limit)
+    word_limit = min(word_limit, total_run_word_limit)
 
     # BabyLM 2026 fast evaluation revisions:
     # 1M-9M, 10M-100M by 10M, and Strict 200M-1B by 100M.
@@ -264,7 +309,11 @@ def _build_word_checkpoint_targets(
     ]
     if word_limit % 100_000_000 != 0 and word_limit > 100_000_000:
         targets.append(word_limit)
-    return [target for target in targets if target <= word_limit]
+    return [
+        target
+        for target in targets
+        if word_exposure_offset < target <= word_limit
+    ]
 
 
 def _format_babylm_revision(words: int) -> str:

@@ -75,6 +75,36 @@ class WordAccountingTest(unittest.TestCase):
 
         self.assertEqual(manager.word_targets[-1], 1_000_000_000)
 
+    def test_encoder_offset_counts_toward_babylm_exposure(self) -> None:
+        config = TrainConfig()
+        config.max_steps = 70
+        config.checkpoint_by_words = True
+        config.checkpoint_word_limit = 100_000_000
+        config.word_exposure_offset = 30_000_000
+        config.data.train_word_count = 10_000_000
+
+        with TemporaryDirectory() as directory:
+            manager = CheckpointManager(
+                directory,
+                config,
+                steps_per_epoch=10,
+                microbatches_per_epoch=20,
+                run_word_limit=70_000_000,
+            )
+            metadata = manager.metadata(
+                step=70,
+                microbatches_seen=140,
+            )
+
+        self.assertEqual(manager.word_targets[0], 40_000_000)
+        self.assertEqual(manager.word_targets[-1], 100_000_000)
+        self.assertNotIn(30_000_000, manager.word_targets)
+        self.assertEqual(metadata["words_seen"], 100_000_000)
+        self.assertEqual(metadata["word_exposure_offset"], 30_000_000)
+        self.assertEqual(metadata["elf_words_seen"], 70_000_000)
+        self.assertEqual(metadata["elf_epochs_completed"], 7.0)
+        self.assertEqual(metadata["epochs_completed"], 10.0)
+
 
 if __name__ == "__main__":
     unittest.main()

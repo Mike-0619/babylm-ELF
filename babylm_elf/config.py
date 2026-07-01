@@ -52,10 +52,14 @@ class DiffusionConfig:
     denoiser_p_mean: float = -1.5
     denoiser_p_std: float = 0.8
     denoiser_noise_scale: float = 2.0
+    decoder_objective: str = "mlm"
     decoder_probability: float = 0.2
     decoder_p_mean: float = 0.8
     decoder_p_std: float = 0.8
     decoder_noise_scale: float = 5.0
+    mlm_mask_probability: float = 0.15
+    mlm_special_token_count: int = 16
+    mlm_min_masks_per_sequence: int = 1
     self_condition_probability: float = 0.5
     self_condition_cfg_min: float = 0.5
     self_condition_cfg_max: float = 5.0
@@ -76,6 +80,7 @@ class TrainConfig:
     save_every: int = 1000
     checkpoint_by_words: bool = False
     checkpoint_word_limit: int | None = None
+    word_exposure_offset: int = 0
     mixed_precision: bool = True
     device: str = "auto"
     model: BabyLMELFConfig = field(default_factory=BabyLMELFConfig)
@@ -84,10 +89,75 @@ class TrainConfig:
     diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
 
 
+@dataclass
+class EncoderModelConfig:
+    base_vocab_size: int = 16384
+    sentinel_start_id: int = 16384
+    sentinel_count: int = 100
+    vocab_size: int = 16484
+    d_model: int = 512
+    d_ff: int = 2048
+    d_kv: int = 64
+    num_layers: int = 6
+    num_decoder_layers: int = 6
+    num_heads: int = 8
+    dropout_rate: float = 0.1
+    layer_norm_epsilon: float = 1.0e-6
+    pad_token_id: int = 3
+    eos_token_id: int = 2
+    decoder_start_token_id: int = 3
+
+
+@dataclass
+class EncoderObjectiveConfig:
+    objective: str = "t5_span_corruption"
+    noise_density: float = 0.15
+    mean_noise_span_length: float = 3.0
+    special_token_count: int = 16
+
+
+@dataclass
+class EncoderTrainConfig:
+    name: str = "encoder"
+    seed: int = 42
+    output_dir: str = "outputs/2026_10M/encoder"
+    epochs: int = 3
+    batch_size: int = 8
+    gradient_accumulation_steps: int = 64
+    log_every: int = 50
+    mixed_precision: bool = True
+    device: str = "auto"
+    data: DataConfig = field(default_factory=DataConfig)
+    model: EncoderModelConfig = field(default_factory=EncoderModelConfig)
+    objective: EncoderObjectiveConfig = field(default_factory=EncoderObjectiveConfig)
+    optim: OptimConfig = field(
+        default_factory=lambda: OptimConfig(
+            optimizer="adamw",
+            learning_rate=1.0e-3,
+            weight_decay=0.0,
+            beta1=0.9,
+            beta2=0.999,
+            eps=1.0e-8,
+            max_grad_norm=1.0,
+            warmup_steps=-1,
+            warmup_epochs=0.4,
+            lr_schedule="cosine",
+            min_lr=0.0,
+            ema_decay=0.0,
+        )
+    )
+
+
 def load_config(path: str | Path) -> TrainConfig:
     path = Path(path)
     raw = _load_mapping(path)
     return _from_mapping(TrainConfig, raw)
+
+
+def load_encoder_config(path: str | Path) -> EncoderTrainConfig:
+    path = Path(path)
+    raw = _load_mapping(path)
+    return _from_mapping(EncoderTrainConfig, raw)
 
 
 def _load_mapping(path: Path) -> dict[str, Any]:
