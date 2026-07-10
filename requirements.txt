@@ -1,14 +1,13 @@
-# Core training
-# Install PyTorch separately to match the cluster CUDA driver, e.g.:
-# pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cu121
+# CUDA PyTorch wheels for NVIDIA H100/H200.
+--extra-index-url https://download.pytorch.org/whl/cu124
 
-# BabyLM data and tokenizer
-datasets>=2.12
-tokenizers>=0.15
-transformers>=4.38
-safetensors>=0.4
+torch>=2.6
+numpy>=1.26
+datasets>=3.2
+transformers>=4.48
+tokenizers>=0.21
+safetensors>=0.5
+huggingface-hub>=0.27
 muon-optimizer>=0.1.0
-
-# Configs and progress bars
-PyYAML>=6.0
-tqdm>=4.65
+PyYAML>=6.0.2
+tqdm>=4.67

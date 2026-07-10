@@ -1,9 +1,36 @@
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import BaseModelOutput, MaskedLMOutput
+
+# Transformers' local remote-code loader copies only direct relative imports from
+# this entrypoint into HF_MODULES_CACHE. Keep this import even though the helper is
+# used by modeling_core.py, otherwise fresh-cache AutoModel loading misses the file.
+try:
+    from .codebook import SphericalCodebook as _hf_cache_codebook_import
+    from .mask_latent import (
+        build_embedding_stats_mask_latent as _hf_cache_mask_latent_import,
+    )
+    from .positions import PositionAttention as _hf_cache_positions_import
+except ImportError:
+    from babylm_elf.modeling.codebook import (
+        SphericalCodebook as _hf_cache_codebook_import,
+    )
+    from babylm_elf.modeling.mask_latent import (
+        build_embedding_stats_mask_latent as _hf_cache_mask_latent_import,
+    )
+    from babylm_elf.modeling.positions import (
+        PositionAttention as _hf_cache_positions_import,
+    )
+
+try:
+    from .layers import RMSNorm as _BabyLMELFRMSNorm
+except ImportError:
+    _BabyLMELFRMSNorm = None
 
 try:
     from .configuration_babylm_elf import BabyLMELFHFConfig
@@ -14,6 +41,16 @@ try:
     from .modeling_core import BabyLMELF, BabyLMELFConfig
 except ImportError:
     from babylm_elf.modeling.model import BabyLMELF, BabyLMELFConfig
+
+def _parse_bool(value: str | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Cannot parse boolean value: {value!r}")
 
 
 class BabyLMELFHFModel(PreTrainedModel):
@@ -36,7 +73,7 @@ class BabyLMELFHFModel(PreTrainedModel):
     @classmethod
     def from_pretrained(cls, *args, **kwargs):
         model = super().from_pretrained(*args, **kwargs)
-        model.babylm_elf._freeze_scratch_encoder()
+        model.babylm_elf._configure_embedding_trainability()
         return model
 
     def get_input_embeddings(self):
@@ -45,12 +82,53 @@ class BabyLMELFHFModel(PreTrainedModel):
     def set_input_embeddings(self, value):
         if self.babylm_elf.token_embedding is None:
             raise ValueError("Scratch-encoder BabyLM-ELF does not expose input embeddings.")
-        self.babylm_elf.token_embedding = value
+        self.babylm_elf.codebook.embedding = value
+
+    def _embed_input_ids(self, input_ids, attention_mask=None):
+        return self.babylm_elf.embed_tokens(
+            input_ids,
+            attention_mask=attention_mask,
+        )
+
+    def _apply_context_ablation(self, embeddings, input_ids, attention_mask=None):
+        mode = os.environ.get("BABYLM_ELF_CONTEXT_ABLATION", "").strip().lower()
+        if mode in {"", "none", "off"}:
+            return embeddings
+        if input_ids is None:
+            return embeddings
+
+        mask_token_id = self.babylm_elf.config.mask_token_id
+        if attention_mask is None:
+            active = torch.ones_like(input_ids, dtype=torch.bool)
+        else:
+            active = attention_mask.bool()
+        if mask_token_id is None:
+            mlm_mask = torch.zeros_like(active)
+        else:
+            mlm_mask = input_ids.eq(mask_token_id) & active
+        visible_mask = active & ~mlm_mask
+
+        if mode == "zero_visible":
+            ablated = embeddings.clone()
+            ablated[visible_mask] = 0.0
+            return ablated
+        if mode == "shuffle_visible":
+            if embeddings.size(0) < 2:
+                return embeddings
+            ablated = embeddings.clone()
+            shuffled = embeddings.roll(shifts=1, dims=0)
+            ablated[visible_mask] = shuffled[visible_mask]
+            return ablated
+        raise ValueError(
+            "Unsupported BABYLM_ELF_CONTEXT_ABLATION="
+            f"{mode!r}. Expected one of: none, off, zero_visible, "
+            "shuffle_visible."
+        )
 
     def tie_weights(self, *args, **kwargs):
         result = super().tie_weights(*args, **kwargs)
-        self.babylm_elf.rope.reset_buffers()
-        self.babylm_elf._freeze_scratch_encoder()
+        self.babylm_elf.position_attention.reset_buffers()
+        self.babylm_elf._configure_embedding_trainability()
         return result
 
     def _decoder_hidden(
@@ -58,6 +136,7 @@ class BabyLMELFHFModel(PreTrainedModel):
         z_t: torch.Tensor,
         attention_mask: torch.Tensor | None,
         t: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size = z_t.size(0)
         if t is None:
@@ -66,6 +145,7 @@ class BabyLMELFHFModel(PreTrainedModel):
             torch.cat((z_t, torch.zeros_like(z_t)), dim=-1),
             t,
             attention_mask=attention_mask,
+            position_ids=position_ids,
             self_cond_cfg_scale=torch.ones(
                 batch_size, device=z_t.device, dtype=z_t.dtype
             ),
@@ -80,6 +160,7 @@ class BabyLMELFHFModel(PreTrainedModel):
         attention_mask=None,
         z_t=None,
         t=None,
+        position_ids=None,
         return_dict=None,
         **_,
     ):
@@ -87,21 +168,24 @@ class BabyLMELFHFModel(PreTrainedModel):
         if z_t is None:
             if input_ids is None:
                 raise ValueError("Provide either input_ids or z_t.")
-            z_t = self.babylm_elf.embed_tokens(
+            z_t = self._embed_input_ids(
                 input_ids,
                 attention_mask=attention_mask,
             )
+            z_t = self._apply_context_ablation(z_t, input_ids, attention_mask)
         elif t is None:
             raise ValueError("Provide t when passing z_t directly.")
 
-        hidden = self._decoder_hidden(z_t, attention_mask, t)
+        hidden = self._decoder_hidden(z_t, attention_mask, t, position_ids)
         if not return_dict:
             return (hidden,)
         return BaseModelOutput(last_hidden_state=hidden)
 
 
 class BabyLMELFForMaskedLM(BabyLMELFHFModel):
-    """Direct masked-token adapter for BabyLM MLM evaluation."""
+    """Masked-token adapter for BabyLM MLM evaluation."""
+
+    _SUPPORTED_MLM_ADAPTER = "mlm_mask_latent"
 
     def forward(
         self,
@@ -109,6 +193,7 @@ class BabyLMELFForMaskedLM(BabyLMELFHFModel):
         attention_mask=None,
         z_t=None,
         t=None,
+        position_ids=None,
         labels=None,
         return_dict=None,
         **_,
@@ -117,15 +202,29 @@ class BabyLMELFForMaskedLM(BabyLMELFHFModel):
         if input_ids is None:
             if z_t is None:
                 raise ValueError("Provide input_ids for MLM evaluation or z_t directly.")
-            hidden = self._decoder_hidden(z_t, attention_mask, t)
-            logits = self._decode_hidden(hidden)
+            logits = self._direct_logits_from_embeddings(
+                z_t, attention_mask, t, position_ids
+            )
         else:
-            embeddings = self.babylm_elf.embed_tokens(
+            self._validate_mlm_adapter()
+            embeddings = self._embed_input_ids(
                 input_ids,
                 attention_mask=attention_mask,
             )
-            hidden = self._decoder_hidden(embeddings, attention_mask, t)
-            logits = self._decode_hidden(hidden)
+            embeddings = self._apply_context_ablation(
+                embeddings,
+                input_ids,
+                attention_mask,
+            )
+            mask_positions = self._mlm_mask_positions(input_ids, attention_mask)
+            if mask_positions.any():
+                embeddings = self._replace_mask_embeddings_with_latent(
+                    embeddings,
+                    mask_positions,
+                )
+            logits = self._direct_logits_from_embeddings(
+                embeddings, attention_mask, t, position_ids
+            )
 
         loss = None
         if labels is not None:
@@ -142,8 +241,63 @@ class BabyLMELFForMaskedLM(BabyLMELFHFModel):
     def _decode_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.babylm_elf.decode_hidden(hidden)
 
+    def _direct_logits_from_embeddings(
+        self,
+        embeddings: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        t: torch.Tensor | None,
+        position_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        hidden = self._decoder_hidden(
+            embeddings,
+            attention_mask,
+            t,
+            position_ids,
+        )
+        return self._decode_hidden(hidden)
+
+    def _validate_mlm_adapter(self) -> None:
+        evaluation_config = getattr(self.config, "evaluation_config", {}) or {}
+        adapter = str(evaluation_config.get("adapter", self._SUPPORTED_MLM_ADAPTER))
+        if adapter != self._SUPPORTED_MLM_ADAPTER:
+            raise ValueError(
+                "BabyLM-ELF MLM scoring only supports "
+                f"{self._SUPPORTED_MLM_ADAPTER!r}; got {adapter!r}. "
+                "Re-export this checkpoint with evaluation_config.adapter="
+                f"{self._SUPPORTED_MLM_ADAPTER!r}."
+            )
+
+    def _mlm_mask_positions(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        mask_token_id = self.config.mask_token_id
+        if mask_token_id is None:
+            return torch.zeros_like(input_ids, dtype=torch.bool)
+        if attention_mask is None:
+            active = torch.ones_like(input_ids, dtype=torch.bool)
+        else:
+            active = attention_mask.bool()
+        return input_ids.eq(mask_token_id) & active
+
+    def _replace_mask_embeddings_with_latent(
+        self,
+        embeddings: torch.Tensor,
+        mask_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        latent = self.babylm_elf.mlm_mask_latent_value(
+            device=embeddings.device,
+            dtype=embeddings.dtype,
+        )
+        return torch.where(
+            mask_positions.unsqueeze(-1),
+            latent.view(1, 1, -1),
+            embeddings,
+        )
+
     @torch.no_grad()
-    def generate(
+    def diagnostic_generate(
         self,
         batch_size: int = 1,
         sequence_length: int | None = None,
@@ -155,7 +309,7 @@ class BabyLMELFForMaskedLM(BabyLMELFHFModel):
         time_schedule: str | None = None,
         **_,
     ):
-        """ELF diagnostic sampler; BabyLM official scoring uses forward()."""
+        """Optional ELF-style debug sampler; BabyLM scoring uses forward()."""
         if num_steps < 1:
             raise ValueError("num_steps must be at least 1.")
         if sampling_method not in {"ode", "sde"}:
@@ -240,3 +394,8 @@ class BabyLMELFForMaskedLM(BabyLMELFHFModel):
             decoder_step_active=True,
         )
         return logits.argmax(dim=-1)
+
+    @torch.no_grad()
+    def generate(self, *args, **kwargs):
+        """Backward-compatible diagnostic alias; not used by BabyLM scoring."""
+        return self.diagnostic_generate(*args, **kwargs)

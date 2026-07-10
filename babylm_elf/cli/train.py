@@ -12,7 +12,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/2026_100M_adamW.yml"),
+        default=Path(
+            "configs/"
+            "2026_10M_learnable_oneperseg_len16_40_filter_punct_ctrl_s0_seq128_bert_head_scaled_size33m_gb128_adamw_lr4e-4_4gpu.yml"
+        ),
     )
     return parser.parse_args()
 

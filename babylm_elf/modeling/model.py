@@ -1,20 +1,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .codebook import SphericalCodebook, UntiedCodebook
 from .layers import (
     BottleneckProjection,
     ELFBlock,
     FinalLayer,
-    RotaryEmbedding,
     TimestepEmbedder,
 )
+from .mask_latent import build_embedding_stats_mask_latent
+from .positions import PositionAttention
 
 
 @dataclass
@@ -37,6 +38,11 @@ class BabyLMELFConfig:
     mask_token_id: int = 4
     embedding_rms: float = 1.0
     embedding_source: str = "learnable"
+    scratch_encoder_trainable: bool = False
+    gaussian_embedding_std: float = 1.0
+    decoder_head_type: str = "gelu"
+    mlm_mask_latent_seed: int = 0
+    mlm_mask_latent_scale: float = 1.0
     encoder_checkpoint_path: str | None = None
     latent_stats_path: str | None = None
     encoder_vocab_size: int = 16484
@@ -55,18 +61,33 @@ class BabyLMELF(nn.Module):
     def __init__(self, config: BabyLMELFConfig) -> None:
         super().__init__()
         self.config = config
-        if config.embedding_source not in {"learnable", "scratch_t5_encoder"}:
+        if config.embedding_source not in {"learnable", "scratch_t5_encoder", "gaussian"}:
             raise ValueError(
-                "embedding_source must be 'learnable' or 'scratch_t5_encoder', "
+                "embedding_source must be 'learnable', 'scratch_t5_encoder', "
+                "or 'gaussian', "
                 f"got {config.embedding_source!r}"
             )
-        self.token_embedding = (
-            nn.Embedding(
+        if config.decoder_head_type not in {"gelu", "bert_mlm", "bert_mlm_scaled"}:
+            raise ValueError(
+                "decoder_head_type must be 'gelu', 'bert_mlm', "
+                f"or 'bert_mlm_scaled', got {config.decoder_head_type!r}"
+            )
+        self.codebook = (
+            SphericalCodebook(
                 config.vocab_size,
                 config.embedding_size,
-                padding_idx=config.pad_token_id,
+                embedding_rms=config.embedding_rms,
             )
             if config.embedding_source == "learnable"
+            else UntiedCodebook(
+                config.vocab_size,
+                config.embedding_size,
+                with_embedding=config.embedding_source == "gaussian",
+            )
+        )
+        self.mlm_mask_latent = (
+            nn.Parameter(torch.empty(config.embedding_size))
+            if self.codebook.embedding is not None
             else None
         )
         self.scratch_encoder = (
@@ -92,16 +113,18 @@ class BabyLMELF(nn.Module):
         self.self_cond_cfg_tokens = nn.Parameter(
             torch.empty(1, config.num_self_cond_cfg_tokens, config.hidden_size)
         )
-        self.mode_tokens = nn.Parameter(
+        self.denoise_mode_tokens = nn.Parameter(
             torch.empty(1, config.num_model_mode_tokens, config.hidden_size)
         )
-
+        self.decode_mode_tokens = nn.Parameter(
+            torch.empty(1, config.num_model_mode_tokens, config.hidden_size)
+        )
         prefix_length = (
             config.num_time_tokens
             + config.num_self_cond_cfg_tokens
             + config.num_model_mode_tokens
         )
-        self.rope = RotaryEmbedding(
+        self.position_attention = PositionAttention(
             config.hidden_size // config.num_attention_heads,
             config.max_position_embeddings,
             prefix_length,
@@ -125,36 +148,48 @@ class BabyLMELF(nn.Module):
             config.layer_norm_eps,
         )
         self.decoder_projection = nn.Linear(config.hidden_size, config.embedding_size)
-        self.unembed_kernel = (
-            nn.Parameter(torch.empty(config.embedding_size, config.base_vocab_size))
-            if config.embedding_source == "scratch_t5_encoder"
+        self.decoder_layer_norm = (
+            nn.LayerNorm(config.embedding_size, eps=config.layer_norm_eps)
+            if config.decoder_head_type in {"bert_mlm", "bert_mlm_scaled"}
             else None
         )
-        self.decoder_bias = nn.Parameter(torch.zeros(config.vocab_size))
+        self.decoder_logit_scale = (
+            nn.Parameter(torch.zeros(()))
+            if config.decoder_head_type == "bert_mlm_scaled"
+            else None
+        )
         self.reset_parameters()
         self._load_scratch_encoder_if_configured()
         self._load_latent_stats_if_configured()
-        self._freeze_scratch_encoder()
+        self._configure_embedding_trainability()
 
     def reset_parameters(self) -> None:
+        self.codebook.reset_parameters()
         if self.token_embedding is not None:
-            nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
+            if self.config.embedding_source == "gaussian":
+                self._init_gaussian_embedding()
         nn.init.xavier_uniform_(self.self_cond_projection.weight)
         nn.init.zeros_(self.self_cond_projection.bias)
         nn.init.xavier_uniform_(self.decoder_projection.weight)
         nn.init.zeros_(self.decoder_projection.bias)
-        if self.unembed_kernel is not None:
-            nn.init.xavier_uniform_(self.unembed_kernel)
+        if self.decoder_layer_norm is not None:
+            nn.init.ones_(self.decoder_layer_norm.weight)
+            nn.init.zeros_(self.decoder_layer_norm.bias)
+        if self.decoder_logit_scale is not None:
+            nn.init.zeros_(self.decoder_logit_scale)
         nn.init.normal_(self.time_tokens, mean=0.0, std=0.02)
         nn.init.normal_(self.self_cond_cfg_tokens, mean=0.0, std=0.02)
-        nn.init.normal_(self.mode_tokens, mean=0.0, std=0.02)
-        if self.token_embedding is not None and self.config.pad_token_id is not None:
-            with torch.no_grad():
-                self.token_embedding.weight[self.config.pad_token_id].zero_()
+        nn.init.normal_(self.denoise_mode_tokens, mean=0.0, std=0.02)
+        nn.init.normal_(self.decode_mode_tokens, mean=0.0, std=0.02)
+        self._init_mlm_mask_latent()
 
     @property
     def embedding_dtype(self) -> torch.dtype:
         return self.decoder_projection.weight.dtype
+
+    @property
+    def token_embedding(self) -> nn.Embedding | None:
+        return self.codebook.embedding
 
     def embed_tokens(
         self,
@@ -163,18 +198,7 @@ class BabyLMELF(nn.Module):
     ) -> torch.Tensor:
         if self.config.embedding_source == "scratch_t5_encoder":
             return self._embed_with_scratch_encoder(input_ids, attention_mask)
-        if self.token_embedding is None:
-            raise RuntimeError("Learnable token embedding is not initialized.")
-        embeddings = F.normalize(
-            self.token_embedding(input_ids).float(),
-            dim=-1,
-        )
-        return embeddings * (math.sqrt(self.config.embedding_size) * self.config.embedding_rms)
-
-    def normalized_embedding_weight(self) -> torch.Tensor:
-        if self.token_embedding is None:
-            raise RuntimeError("Scratch encoder mode uses independent unembedding.")
-        return F.normalize(self.token_embedding.weight.float(), dim=-1)
+        return self.codebook.lookup(input_ids).to(dtype=self.embedding_dtype)
 
     def decode_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
         with torch.autocast(device_type=hidden.device.type, enabled=False):
@@ -182,9 +206,12 @@ class BabyLMELF(nn.Module):
                 self.decoder_projection(hidden.float()),
                 approximate="tanh",
             )
-            if self.unembed_kernel is not None:
-                return decoder_hidden @ self.unembed_kernel.float() + self.decoder_bias
-            return decoder_hidden @ self.normalized_embedding_weight().T + self.decoder_bias
+            if self.decoder_layer_norm is not None:
+                decoder_hidden = self.decoder_layer_norm(decoder_hidden)
+            scores = self.codebook.project(decoder_hidden)
+            if self.decoder_logit_scale is not None:
+                scores = scores * self.decoder_logit_scale.exp()
+            return scores + self.codebook.bias.float()
 
     def build_context(
         self,
@@ -203,6 +230,7 @@ class BabyLMELF(nn.Module):
         x: torch.Tensor,
         t: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
         self_cond_cfg_scale: torch.Tensor | None = None,
         decoder_step_active: torch.Tensor | bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -210,6 +238,7 @@ class BabyLMELF(nn.Module):
             x,
             t,
             attention_mask=attention_mask,
+            position_ids=position_ids,
             self_cond_cfg_scale=self_cond_cfg_scale,
             decoder_step_active=decoder_step_active,
         )
@@ -223,6 +252,7 @@ class BabyLMELF(nn.Module):
         x: torch.Tensor,
         t: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
         self_cond_cfg_scale: torch.Tensor | None = None,
         decoder_step_active: torch.Tensor | bool | None = None,
     ) -> torch.Tensor:
@@ -247,21 +277,27 @@ class BabyLMELF(nn.Module):
             x = self.text_projection(x.float())
             context = self.build_context(t, self_cond_cfg_scale)
 
-        mode = self.mode_tokens.expand(batch, -1, -1)
-        mode = mode * decoder_step_active.to(mode.dtype).view(-1, 1, 1)
+        mode = self._build_mode_tokens(
+            decoder_step_active,
+            batch=batch,
+            device=x.device,
+            dtype=x.dtype,
+        )
         x = torch.cat((context, mode, x), dim=1)
         prefix_length = context.size(1) + mode.size(1)
-        if attention_mask is not None:
-            prefix_mask = torch.ones(
-                batch,
-                prefix_length,
-                device=attention_mask.device,
-                dtype=attention_mask.dtype,
-            )
-            attention_mask = torch.cat((prefix_mask, attention_mask), dim=1)
+        if prefix_length != self.position_attention.prefix_length:
+            raise RuntimeError("Runtime prefix length does not match model configuration.")
+        prepared_attention = self.position_attention(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            batch_size=batch,
+            text_length=x.size(1) - prefix_length,
+            device=x.device,
+            dtype=x.dtype,
+        )
 
         for block in self.blocks:
-            x = block(x, self.rope, attention_mask)
+            x = block(x, prepared_attention)
         return x[:, prefix_length:]
 
     def denoise(
@@ -279,9 +315,36 @@ class BabyLMELF(nn.Module):
         return prediction
 
     def decode_embeddings(self, embeddings: torch.Tensor) -> torch.Tensor:
-        if self.unembed_kernel is not None:
-            return embeddings.float() @ self.unembed_kernel.float() + self.decoder_bias
-        return embeddings.float() @ self.normalized_embedding_weight().T + self.decoder_bias
+        return self.codebook.decode(embeddings)
+
+    def mlm_mask_latent_value(
+        self,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if self.mlm_mask_latent is None:
+            raise ValueError(
+                "mlm_mask_latent requires a learned token embedding table. "
+                "Scratch-encoder BabyLM-ELF models do not expose one."
+            )
+        return self.mlm_mask_latent.to(device=device, dtype=dtype)
+
+    def _build_mode_tokens(
+        self,
+        decoder_step_active: torch.Tensor,
+        *,
+        batch: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        active = decoder_step_active.to(device=device, dtype=dtype).reshape(batch, 1, 1)
+        denoise_mode = self.denoise_mode_tokens.to(device=device, dtype=dtype)
+        decode_mode = self.decode_mode_tokens.to(device=device, dtype=dtype)
+        return denoise_mode.expand(batch, -1, -1).lerp(
+            decode_mode.expand(batch, -1, -1),
+            active,
+        )
 
     def _build_scratch_encoder(self, config: BabyLMELFConfig) -> T5EncoderModel:
         from transformers import T5Config, T5EncoderModel
@@ -335,12 +398,56 @@ class BabyLMELF(nn.Module):
         self.latent_mean.copy_(mean)
         self.latent_std.copy_(std)
 
+    def _init_gaussian_embedding(self) -> None:
+        if self.token_embedding is None:
+            return
+        nn.init.normal_(
+            self.token_embedding.weight,
+            mean=0.0,
+            std=self.config.gaussian_embedding_std,
+        )
+        with torch.no_grad():
+            weight = self.token_embedding.weight
+            weight.sub_(weight.mean(dim=-1, keepdim=True))
+            std = weight.std(dim=-1, keepdim=True, unbiased=False).clamp_min(1.0e-6)
+            weight.div_(std)
+            weight.mul_(self.config.gaussian_embedding_std)
+
+    def _init_mlm_mask_latent(self) -> None:
+        if self.token_embedding is None or self.mlm_mask_latent is None:
+            return
+        if self.token_embedding.weight.is_meta or self.mlm_mask_latent.is_meta:
+            return
+        latent = build_embedding_stats_mask_latent(
+            self.token_embedding.weight,
+            embedding_size=self.config.embedding_size,
+            embedding_rms=self.config.embedding_rms,
+            pad_token_id=self.config.pad_token_id,
+            seed=self.config.mlm_mask_latent_seed,
+            scale=self.config.mlm_mask_latent_scale,
+        )
+        with torch.no_grad():
+            self.mlm_mask_latent.copy_(latent.to(self.mlm_mask_latent))
+
+    def _configure_embedding_trainability(self) -> None:
+        if self.config.embedding_source == "gaussian" and self.token_embedding is not None:
+            self.token_embedding.weight.requires_grad_(False)
+        self._configure_scratch_encoder_trainability()
+
+    def _configure_scratch_encoder_trainability(self) -> None:
+        if self.scratch_encoder is None:
+            return
+        trainable = bool(self.config.scratch_encoder_trainable)
+        if not trainable:
+            self.scratch_encoder.eval()
+        for parameter in self.scratch_encoder.parameters():
+            parameter.requires_grad_(trainable)
+
     def _freeze_scratch_encoder(self) -> None:
         if self.scratch_encoder is None:
             return
-        self.scratch_encoder.eval()
-        for parameter in self.scratch_encoder.parameters():
-            parameter.requires_grad_(False)
+        self.config.scratch_encoder_trainable = False
+        self._configure_scratch_encoder_trainability()
 
     def _embed_with_scratch_encoder(
         self,
@@ -352,17 +459,23 @@ class BabyLMELF(nn.Module):
         if attention_mask is None:
             attention_mask = input_ids.ne(self.config.pad_token_id).to(torch.long)
         encoder_ids = self._replace_mask_spans_with_sentinels(input_ids, attention_mask)
-        was_training = self.scratch_encoder.training
-        self.scratch_encoder.eval()
-        try:
-            with torch.no_grad():
-                outputs = self.scratch_encoder(
-                    input_ids=encoder_ids,
-                    attention_mask=attention_mask,
-                ).last_hidden_state
-        finally:
-            if was_training:
-                self.scratch_encoder.train()
+        if self.config.scratch_encoder_trainable:
+            outputs = self.scratch_encoder(
+                input_ids=encoder_ids,
+                attention_mask=attention_mask,
+            ).last_hidden_state
+        else:
+            was_training = self.scratch_encoder.training
+            self.scratch_encoder.eval()
+            try:
+                with torch.no_grad():
+                    outputs = self.scratch_encoder(
+                        input_ids=encoder_ids,
+                        attention_mask=attention_mask,
+                    ).last_hidden_state
+            finally:
+                if was_training:
+                    self.scratch_encoder.train()
         normalized = (outputs.float() - self.latent_mean) / self.latent_std.clamp_min(1.0e-6)
         return normalized.to(dtype=self.embedding_dtype)
 

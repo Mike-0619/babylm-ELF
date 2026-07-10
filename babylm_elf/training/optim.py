@@ -26,6 +26,12 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def runtime_seed_for_rank(base_seed: int, rank: int) -> int:
+    if rank < 0:
+        raise ValueError(f"rank must be non-negative, got {rank}.")
+    return int(base_seed) + int(rank)
+
+
 def resolve_device(device: str) -> torch.device:
     if device == "auto":
         if not torch.cuda.is_available():
@@ -40,24 +46,37 @@ def create_optimizer(model: torch.nn.Module, config) -> torch.optim.Optimizer:
         return muon_with_aux_adam(
             model,
             lr=config.learning_rate,
+            aux_lr=getattr(config, "aux_learning_rate", None),
+            encoder_lr_multiplier=getattr(config, "encoder_lr_multiplier", 1.0),
             betas=(config.beta1, config.beta2),
             eps=config.eps,
         )
 
-    no_decay = ("bias", "norm", "embedding")
-    decay_params = []
-    no_decay_params = []
+    no_decay = ("bias", "norm", "embedding", "latent")
+    grouped_params: dict[tuple[bool, bool], list[torch.nn.Parameter]] = {
+        (False, False): [],
+        (False, True): [],
+        (True, False): [],
+        (True, True): [],
+    }
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if any(nd in name.lower() for nd in no_decay):
-            no_decay_params.append(param)
-        else:
-            decay_params.append(param)
-    groups = [
-        {"params": decay_params, "weight_decay": config.weight_decay},
-        {"params": no_decay_params, "weight_decay": 0.0},
-    ]
+        is_encoder = name.startswith("scratch_encoder.")
+        use_no_decay = any(nd in name.lower() for nd in no_decay)
+        grouped_params[(is_encoder, use_no_decay)].append(param)
+    encoder_lr_multiplier = getattr(config, "encoder_lr_multiplier", 1.0)
+    groups = []
+    for (is_encoder, use_no_decay), params in grouped_params.items():
+        if not params:
+            continue
+        groups.append(
+            {
+                "params": params,
+                "lr": config.learning_rate * (encoder_lr_multiplier if is_encoder else 1.0),
+                "weight_decay": 0.0 if use_no_decay else config.weight_decay,
+            }
+        )
     if optimizer_name == "adamw":
         return torch.optim.AdamW(
             groups,
@@ -96,8 +115,19 @@ def create_scheduler(
 
 
 class ExponentialMovingAverage:
-    def __init__(self, model: torch.nn.Module, decay: float) -> None:
-        self.decay = decay
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        decay: float,
+        *,
+        warmup: bool = True,
+    ) -> None:
+        if not 0.0 <= decay < 1.0:
+            raise ValueError(f"EMA decay must be in [0, 1), got {decay}.")
+        self.decay = float(decay)
+        self.warmup = bool(warmup)
+        self.num_updates = 0
+        self.current_decay = 0.0
         self.shadow = {
             name: parameter.detach().clone()
             for name, parameter in model.named_parameters()
@@ -106,15 +136,44 @@ class ExponentialMovingAverage:
 
     @torch.no_grad()
     def update(self, model: torch.nn.Module) -> None:
+        self.num_updates += 1
+        self.current_decay = self.decay_for_update(self.num_updates)
         for name, parameter in model.named_parameters():
             if name in self.shadow:
-                self.shadow[name].lerp_(parameter.detach(), 1.0 - self.decay)
+                self.shadow[name].lerp_(
+                    parameter.detach(),
+                    1.0 - self.current_decay,
+                )
+
+    def decay_for_update(self, num_updates: int) -> float:
+        if num_updates <= 0:
+            raise ValueError(
+                f"EMA num_updates must be positive, got {num_updates}."
+            )
+        if not self.warmup:
+            return self.decay
+        warmup_decay = (1.0 + num_updates) / (10.0 + num_updates)
+        return min(self.decay, warmup_decay)
 
     def state_dict(self) -> dict:
-        return {"decay": self.decay, "shadow": self.shadow}
+        return {
+            "decay": self.decay,
+            "warmup": self.warmup,
+            "num_updates": self.num_updates,
+            "current_decay": self.current_decay,
+            "shadow": self.shadow,
+        }
 
     def load_state_dict(self, state: dict) -> None:
-        self.decay = state["decay"]
+        self.decay = float(state["decay"])
+        self.warmup = bool(state.get("warmup", False))
+        self.num_updates = int(state.get("num_updates", 0))
+        self.current_decay = float(
+            state.get(
+                "current_decay",
+                self.decay if self.num_updates > 0 else 0.0,
+            )
+        )
         self.shadow = state["shadow"]
 
     def model_state_dict(self, model: torch.nn.Module) -> dict[str, torch.Tensor]:
@@ -142,3 +201,27 @@ class ExponentialMovingAverage:
                 for name, parameter in model.named_parameters():
                     if name in backup:
                         parameter.copy_(backup[name])
+
+
+def resolve_ema_decay(
+    reference_decay: float,
+    reference_steps: int,
+    total_optimizer_steps: int,
+) -> float:
+    if not 0.0 <= reference_decay < 1.0:
+        raise ValueError(
+            "EMA reference_decay must be in [0, 1), "
+            f"got {reference_decay}."
+        )
+    if reference_steps <= 0:
+        raise ValueError(
+            f"EMA reference_steps must be positive, got {reference_steps}."
+        )
+    if total_optimizer_steps <= 0:
+        raise ValueError(
+            "EMA total_optimizer_steps must be positive, "
+            f"got {total_optimizer_steps}."
+        )
+    return float(reference_decay) ** (
+        float(reference_steps) / float(total_optimizer_steps)
+    )

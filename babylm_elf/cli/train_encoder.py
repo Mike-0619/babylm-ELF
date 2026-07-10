@@ -10,7 +10,10 @@ from transformers import T5Config, T5ForConditionalGeneration
 
 from babylm_elf.config import EncoderTrainConfig, load_encoder_config
 from babylm_elf.data.datasets import build_dataloader
-from babylm_elf.data.text import count_clean_words
+from babylm_elf.data.manifest import (
+    load_data_manifest,
+    validate_training_data_manifest,
+)
 from babylm_elf.data.tokenizer import load_tokenizer
 from babylm_elf.encoder.span_corruption import make_t5_span_corruption_batch
 from babylm_elf.training.checkpointing import _atomic_torch_save
@@ -39,6 +42,8 @@ def train_encoder_from_config(config: EncoderTrainConfig) -> None:
     device = resolve_device(config.device)
     tokenizer = load_tokenizer(config.data.tokenizer_path)
     _sync_vocab_settings(config, tokenizer)
+    data_manifest = validate_training_data_manifest(config.data, tokenizer)
+    _validate_encoder_train_word_count(config, data_manifest)
 
     train_generator = torch.Generator()
     train_generator.manual_seed(config.seed)
@@ -164,6 +169,18 @@ def _sync_vocab_settings(config: EncoderTrainConfig, tokenizer) -> None:
         config.model.eos_token_id = eos_token_id
 
 
+def _validate_encoder_train_word_count(
+    config: EncoderTrainConfig,
+    manifest: dict,
+) -> None:
+    expected = config.data.train_word_count
+    actual = int(manifest["normalization"]["words"])
+    print(
+        "Encoder training corpus: "
+        f"{expected:,} official words; {actual:,} normalized usable words"
+    )
+
+
 def _make_t5_config(config: EncoderTrainConfig) -> T5Config:
     return T5Config(
         vocab_size=config.model.vocab_size,
@@ -263,8 +280,12 @@ def _compute_and_save_latent_stats(
         "metadata": {
             "train_word_count": config.data.train_word_count,
             "actual_train_word_count": (
-                count_clean_words(config.data.train_text)
-                if config.data.train_text
+                int(
+                    load_data_manifest(config.data.manifest_path)["normalization"][
+                        "words"
+                    ]
+                )
+                if config.data.manifest_path
                 else None
             ),
         },

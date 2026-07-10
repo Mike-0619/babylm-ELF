@@ -4,6 +4,7 @@ from dataclasses import MISSING, dataclass, field
 from pathlib import Path
 from typing import Any, get_type_hints
 import json
+import unicodedata
 
 import yaml
 
@@ -24,15 +25,22 @@ class DataConfig:
     valid_path: str | None = "data/text_data/dev_tokenized.bin"
     tokenizer_path: str = "data/tokenizer_100M.json"
     tokenizer_vocab_size: int = 16384
+    manifest_path: str | None = None
     seq_length: int = 1024
     num_workers: int = 0
     train_word_count: int | None = None
+    expected_normalized_word_count: int | None = None
+    expected_dropped_rows: int | None = None
+    expected_subword_count: int | None = None
+    expected_stream_tokens: int | None = None
 
 
 @dataclass
 class OptimConfig:
     optimizer: str = "muon"
     learning_rate: float = 1.25e-4
+    aux_learning_rate: float | None = None
+    encoder_lr_multiplier: float = 1.0
     weight_decay: float = 0.0
     beta1: float = 0.9
     beta2: float = 0.999
@@ -42,7 +50,9 @@ class OptimConfig:
     warmup_epochs: float | None = 0.5
     lr_schedule: str = "constant"
     min_lr: float = 0.0
-    ema_decay: float = 0.9999
+    ema_reference_decay: float = 0.9999
+    ema_reference_steps: int = 95_000
+    ema_warmup: bool = True
 
 
 @dataclass
@@ -52,14 +62,20 @@ class DiffusionConfig:
     denoiser_p_mean: float = -1.5
     denoiser_p_std: float = 0.8
     denoiser_noise_scale: float = 2.0
-    decoder_objective: str = "mlm"
+    decoder_objective: str = "token_mlm"
     decoder_probability: float = 0.2
-    decoder_p_mean: float = 0.8
-    decoder_p_std: float = 0.8
-    decoder_noise_scale: float = 5.0
-    mlm_mask_probability: float = 0.15
+    mlm_mask_strategy: str = "one_per_segment_step10_then_step20"
+    mlm_mask_schedule: str = "random"
+    mlm_mask_seed: int = 0
+    mlm_segment_aware: bool = False
+    mlm_segment_boundary_token_id: int = 1
     mlm_special_token_count: int = 16
-    mlm_min_masks_per_sequence: int = 1
+    mlm_filter_punctuation_only: bool = False
+    mlm_filter_empty_control: bool = False
+    mlm_excluded_token_ids: list[int] = field(default_factory=list)
+    mlm_eval_adapter: str = "mlm_mask_latent"
+    mlm_mask_latent_seed: int = 0
+    mlm_mask_latent_scale: float = 1.0
     self_condition_probability: float = 0.5
     self_condition_cfg_min: float = 0.5
     self_condition_cfg_max: float = 5.0
@@ -81,6 +97,7 @@ class TrainConfig:
     checkpoint_by_words: bool = False
     checkpoint_word_limit: int | None = None
     word_exposure_offset: int = 0
+    encoder_freeze_steps_ratio: float = 0.0
     mixed_precision: bool = True
     device: str = "auto"
     model: BabyLMELFConfig = field(default_factory=BabyLMELFConfig)
@@ -143,7 +160,8 @@ class EncoderTrainConfig:
             warmup_epochs=0.4,
             lr_schedule="cosine",
             min_lr=0.0,
-            ema_decay=0.0,
+            ema_reference_decay=0.0,
+            ema_warmup=False,
         )
     )
 
@@ -151,7 +169,15 @@ class EncoderTrainConfig:
 def load_config(path: str | Path) -> TrainConfig:
     path = Path(path)
     raw = _load_mapping(path)
-    return _from_mapping(TrainConfig, raw)
+    config = _from_mapping(TrainConfig, raw)
+    _populate_mlm_excluded_token_ids(config, path)
+    sync_model_mlm_mask_latent_config(config)
+    return config
+
+
+def sync_model_mlm_mask_latent_config(config: TrainConfig) -> None:
+    config.model.mlm_mask_latent_seed = int(config.diffusion.mlm_mask_latent_seed)
+    config.model.mlm_mask_latent_scale = float(config.diffusion.mlm_mask_latent_scale)
 
 
 def load_encoder_config(path: str | Path) -> EncoderTrainConfig:
@@ -190,3 +216,81 @@ def _from_mapping(cls, data: dict[str, Any]):
             value = _from_mapping(field_type, value)
         kwargs[field_info.name] = value
     return cls(**kwargs)
+
+
+def _populate_mlm_excluded_token_ids(config: TrainConfig, config_path: Path) -> None:
+    diffusion = config.diffusion
+    if not (
+        diffusion.mlm_filter_empty_control
+        or diffusion.mlm_filter_punctuation_only
+    ):
+        diffusion.mlm_excluded_token_ids = sorted(
+            {int(token_id) for token_id in diffusion.mlm_excluded_token_ids}
+        )
+        return
+
+    tokenizer_path = _resolve_config_relative_path(
+        config.data.tokenizer_path,
+        config_path,
+    )
+    generated = _filtered_token_ids_from_tokenizer(
+        tokenizer_path,
+        filter_empty_control=diffusion.mlm_filter_empty_control,
+        filter_punctuation_only=diffusion.mlm_filter_punctuation_only,
+    )
+    diffusion.mlm_excluded_token_ids = sorted(
+        {int(token_id) for token_id in diffusion.mlm_excluded_token_ids}
+        | generated
+    )
+
+
+def _resolve_config_relative_path(path: str | Path, config_path: Path) -> Path:
+    candidate = Path(path)
+    if candidate.is_absolute() or candidate.exists():
+        return candidate
+    for parent in config_path.resolve().parents:
+        resolved = parent / candidate
+        if resolved.exists():
+            return resolved
+    return candidate
+
+
+def _filtered_token_ids_from_tokenizer(
+    tokenizer_path: Path,
+    *,
+    filter_empty_control: bool,
+    filter_punctuation_only: bool,
+) -> set[int]:
+    with tokenizer_path.open("r", encoding="utf-8") as handle:
+        tokenizer_json = json.load(handle)
+    vocab = tokenizer_json.get("model", {}).get("vocab", {})
+    if not isinstance(vocab, dict):
+        return set()
+
+    excluded: set[int] = set()
+    for token, token_id in vocab.items():
+        if not isinstance(token_id, int):
+            continue
+        normalized = _normalize_token_piece(token)
+        if filter_empty_control and _is_empty_or_control(normalized):
+            excluded.add(token_id)
+            continue
+        if filter_punctuation_only and _is_punctuation_or_symbol_only(normalized):
+            excluded.add(token_id)
+    return excluded
+
+
+def _normalize_token_piece(token: str) -> str:
+    return token.replace("Ġ", "").replace("▁", "").strip()
+
+
+def _is_empty_or_control(token: str) -> bool:
+    if token == "":
+        return True
+    return any(unicodedata.category(char) in {"Cc", "Cf"} for char in token)
+
+
+def _is_punctuation_or_symbol_only(token: str) -> bool:
+    return token != "" and all(
+        unicodedata.category(char)[0] in {"P", "S"} for char in token
+    )

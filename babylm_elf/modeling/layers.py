@@ -6,6 +6,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    from .sdpa import sdpa_attention
+except ImportError:
+    from babylm_elf.modeling.sdpa import sdpa_attention
+
+try:
+    from .positions import PreparedAttention
+except ImportError:
+    from babylm_elf.modeling.positions import PreparedAttention
+
 
 def _init_linear(layer: nn.Linear, zero: bool = False) -> nn.Linear:
     if zero:
@@ -23,47 +33,12 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.stack((-x2, x1), dim=-1).flatten(-2)
 
 
-class RotaryEmbedding(nn.Module):
-    def __init__(self, dim: int, max_length: int, prefix_length: int, theta: float = 10000.0) -> None:
-        super().__init__()
-        self.dim = dim
-        self.max_length = max_length
-        self.prefix_length = prefix_length
-        self.theta = theta
-        cos, sin = self._build_buffers()
-        self.register_buffer("cos", cos, persistent=False)
-        self.register_buffer("sin", sin, persistent=False)
-
-    def _build_buffers(self) -> tuple[torch.Tensor, torch.Tensor]:
-        inv_freq = 1.0 / (
-            self.theta
-            ** (
-                torch.arange(0, self.dim, 2, dtype=torch.float32)[: self.dim // 2]
-                / self.dim
-            )
-        )
-        positions = torch.arange(self.max_length, dtype=torch.float32)
-        freqs = torch.outer(positions, inv_freq).repeat_interleave(2, dim=-1)
-        cos = torch.cat(
-            (torch.ones(self.prefix_length, self.dim), freqs.cos()),
-            dim=0,
-        )
-        sin = torch.cat(
-            (torch.zeros(self.prefix_length, self.dim), freqs.sin()),
-            dim=0,
-        )
-        return cos, sin
-
-    def reset_buffers(self) -> None:
-        cos, sin = self._build_buffers()
-        self.cos = cos.to(device=self.cos.device)
-        self.sin = sin.to(device=self.sin.device)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        length = x.size(-2)
-        cos = self.cos[:length].to(device=x.device, dtype=x.dtype)
-        sin = self.sin[:length].to(device=x.device, dtype=x.dtype)
-        return x * cos + rotate_half(x) * sin
+def apply_rotary(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    return x * cos + rotate_half(x) * sin
 
 
 class RMSNorm(nn.Module):
@@ -129,27 +104,22 @@ class Attention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        rope: RotaryEmbedding,
-        attention_mask: torch.Tensor | None,
+        attention: PreparedAttention,
     ) -> torch.Tensor:
         batch, length, hidden = x.shape
         qkv = self.qkv(x).view(batch, length, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.permute(2, 0, 3, 1, 4)
-        q = rope(self.q_norm(q))
-        k = rope(self.k_norm(k))
-        mask = None
-        if attention_mask is not None:
-            mask = attention_mask[:, None, None, :].bool()
-        output = F.scaled_dot_product_attention(
+        q = apply_rotary(self.q_norm(q), attention.rope_cos, attention.rope_sin)
+        k = apply_rotary(self.k_norm(k), attention.rope_cos, attention.rope_sin)
+        output = sdpa_attention(
             q,
             k,
             v,
-            attn_mask=mask,
+            attn_mask=attention.padding_mask,
             dropout_p=self.dropout if self.training else 0.0,
         )
         output = output.transpose(1, 2).reshape(batch, length, hidden)
         return self.out(output)
-
 
 class SwiGLU(nn.Module):
     def __init__(self, hidden_size: int, mlp_ratio: float, dropout: float) -> None:
@@ -184,10 +154,9 @@ class ELFBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        rope: RotaryEmbedding,
-        attention_mask: torch.Tensor | None,
+        attention: PreparedAttention,
     ) -> torch.Tensor:
-        x = x + self.attention(self.norm1(x), rope, attention_mask)
+        x = x + self.attention(self.norm1(x), attention)
         x = x + self.mlp(self.norm2(x))
         return x
 

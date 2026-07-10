@@ -3,9 +3,15 @@ from __future__ import annotations
 from pathlib import Path
 from dataclasses import asdict, is_dataclass
 import os
+from typing import Literal
 import uuid
 
 import torch
+
+from babylm_elf.submission.contract import checkpoint_targets, revision_for_words
+
+
+ModelWeights = Literal["ema", "raw"]
 
 
 class CheckpointManager:
@@ -68,7 +74,7 @@ class CheckpointManager:
             and words_seen >= self.word_targets[self.next_word_checkpoint]
         ):
             target_words = self.word_targets[self.next_word_checkpoint]
-            revision = _format_babylm_revision(target_words)
+            revision = revision_for_words(target_words)
             save_checkpoint(
                 self.checkpoint_dir / "babylm_required" / f"{revision}.pt",
                 state,
@@ -173,7 +179,7 @@ class CheckpointManager:
             )
         if target_words is not None:
             metadata["target_words"] = target_words
-            metadata["revision_name"] = _format_babylm_revision(target_words)
+            metadata["revision_name"] = revision_for_words(target_words)
         return metadata
 
     def words_seen(
@@ -234,18 +240,27 @@ def save_checkpoint(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     metadata = dict(metadata or {})
-    raw_model_state = state.model.state_dict()
+    model = _unwrap_model(state.model)
+    raw_model_state = model.state_dict()
     ema_model_state = (
-        state.ema.model_state_dict(state.model) if state.ema is not None else raw_model_state
+        state.ema.model_state_dict(model) if state.ema is not None else raw_model_state
     )
+    metadata.update(_training_stability_metadata(state, config))
     checkpoint = {
+        "checkpoint_format_version": 2,
         # Evaluation/export uses EMA, matching the paper.
         "model": ema_model_state,
+        "model_ema": ema_model_state,
+        "model_raw": raw_model_state,
         "step": state.step,
         "config": asdict(config) if is_dataclass(config) else config,
         "metadata": metadata,
     }
     _atomic_torch_save(checkpoint, path)
+
+
+def _unwrap_model(model):
+    return getattr(model, "module", model)
 
 
 def _atomic_torch_save(checkpoint: dict, path: Path) -> None:
@@ -260,11 +275,61 @@ def _atomic_torch_save(checkpoint: dict, path: Path) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
-def load_model_weights(path: str | Path, model: torch.nn.Module, map_location: str | torch.device = "cpu") -> dict:
+def load_model_weights(
+    path: str | Path,
+    model: torch.nn.Module,
+    map_location: str | torch.device = "cpu",
+    *,
+    weights: ModelWeights = "ema",
+) -> dict:
     checkpoint = torch.load(path, map_location=map_location, weights_only=True)
-    weights = checkpoint.get("model", checkpoint)
-    model.load_state_dict(weights)
+    model.load_state_dict(select_model_weights(checkpoint, weights=weights))
     return checkpoint
+
+
+def select_model_weights(
+    checkpoint: dict,
+    *,
+    weights: ModelWeights = "ema",
+) -> dict[str, torch.Tensor]:
+    if weights not in {"ema", "raw"}:
+        raise ValueError(
+            f"Unknown checkpoint weights {weights!r}; choose 'ema' or 'raw'."
+        )
+    if weights == "raw":
+        if isinstance(checkpoint, dict) and "model_raw" in checkpoint:
+            return checkpoint["model_raw"]
+        raise KeyError(
+            "Raw model weights were requested, but this checkpoint has no "
+            "'model_raw' entry. Legacy checkpoints only contain EMA weights."
+        )
+    if isinstance(checkpoint, dict):
+        if "model_ema" in checkpoint:
+            return checkpoint["model_ema"]
+        if "model" in checkpoint:
+            return checkpoint["model"]
+    return checkpoint
+
+
+def _training_stability_metadata(state, config) -> dict[str, int | float | str | bool]:
+    metadata: dict[str, int | float | str | bool] = {
+        "model_init_seed": int(config.seed),
+        "runtime_seed_policy": "base_seed_plus_global_rank",
+        "runtime_seed_rank0": int(config.seed),
+    }
+    if state.ema is None:
+        return metadata
+    metadata.update(
+        {
+            "ema_reference_decay": float(config.optim.ema_reference_decay),
+            "ema_reference_steps": int(config.optim.ema_reference_steps),
+            "ema_resolved_decay": float(state.ema.decay),
+            "ema_current_decay": float(state.ema.current_decay),
+            "ema_num_updates": int(state.ema.num_updates),
+            "ema_warmup": bool(state.ema.warmup),
+        }
+    )
+    return metadata
 
 
 def _build_word_checkpoint_targets(
@@ -300,26 +365,7 @@ def _build_word_checkpoint_targets(
         )
     word_limit = min(word_limit, total_run_word_limit)
 
-    # BabyLM 2026 fast evaluation revisions:
-    # 1M-9M, 10M-100M by 10M, and Strict 200M-1B by 100M.
-    targets = [
-        *range(1_000_000, 10_000_000, 1_000_000),
-        *range(10_000_000, 100_000_000 + 1, 10_000_000),
-        *range(200_000_000, word_limit + 1, 100_000_000),
-    ]
-    if word_limit % 100_000_000 != 0 and word_limit > 100_000_000:
-        targets.append(word_limit)
-    return [
-        target
-        for target in targets
-        if word_exposure_offset < target <= word_limit
-    ]
-
-
-def _format_babylm_revision(words: int) -> str:
-    if words % 1_000_000 != 0:
-        raise ValueError(
-            "BabyLM checkpoint exposure must be a whole number of millions: "
-            f"{words}"
-        )
-    return f"chck_{words // 1_000_000}M"
+    return checkpoint_targets(
+        word_limit,
+        word_exposure_offset=word_exposure_offset,
+    )

@@ -2,7 +2,7 @@
 
 > **Implementation status (June 2026):** The executable code now follows the
 > ELF paper's mixed denoiser/decoder objective, rectified-flow direction,
-> logit-normal schedules, decoder corruption, self-conditioning CFG,
+> logit-normal schedules, learned-latent MLM decoder, self-conditioning CFG,
 > RMSNorm/RoPE/qk-norm architecture, MuonWithAuxAdam, warmup, and EMA export.
 > Official BabyLM competition configs use 10 epochs; shorter ELF
 > paper-alignment and learning-rate sweeps are treated as ablations.
@@ -177,8 +177,9 @@ Checkpoint files:
 ```
 
 The word-based checkpoints include metadata such as `words_seen`,
-`target_words`, and `steps_per_epoch`. They are model-only checkpoints so the
-output directory stays compact. Short test configs may still use step-based
+`target_words`, `steps_per_epoch`, RNG policy, and resolved EMA state. Every new
+checkpoint stores raw and EMA model weights; `model` remains an EMA alias for
+older evaluation/export code. Short test configs may still use step-based
 checkpointing, but final BabyLM runs should use the word-based policy above.
 
 Not allowed in the main model:
@@ -198,7 +199,8 @@ Hugging Face BabyLM dataset
   -> local raw text cache under data/<run>/raw/
   -> babylm_elf.cli.prepare_data
   -> year-specific byte-level BPE tokenizer under data/<run>/tokenizer/
-  -> torch-saved tokenized documents under data/<run>/tokenized/
+  -> flat little-endian int16 token stream under data/<run>/tokenized/
+  -> read-only mmap fixed-length chunks during training
 ```
 
 Current 2026 data-processing decision:
@@ -215,16 +217,27 @@ pre-tokenizer         = Unicode letter/number/punctuation regex split
                       + Split(Regex(".{1,24}"))
 post-processor        = single: "<s> $A"; pair: "<s> $A <s> $B"
 tokenizer JSON cleanup = remove the final 256 byte-alphabet added_tokens entries
-document cleanup      = strip, remove one-line Wiki-style "= = = ... = = =" headings, strip again
+document normalization = CRLF/CR -> LF; tab -> one ASCII space;
+                       U+200B/U+FEFF -> space; delete format controls; strip row ends
+content preservation  = keep speaker labels, Wiki headings, HTML/ref text, and inner whitespace
 encoded dtype         = torch.int16
-seq_length            = 1024 tokens per training example
+storage format        = flat_int16_le_v1 (raw signed int16, little-endian)
+logical stream        = <s> row1_ids <s> row2_ids ...
+stream construction   = row-order streaming with an approximately 1M-ID buffer
+runtime reader        = torch.from_file mmap; batch slices convert to torch.long
+distributed sampling  = no padding duplicates; rotate/drop remainder chunks
+seq_length            = 128 tokens per training example
 ```
 
-This mirrors the tokenizer/data-preparation recipe used in the 2025
-BabyLM diffusion winner's released code, but it is implemented directly in this
-repository. The 2026 configs now use the standard path
-`data/2026_100M/{tokenizer,tokenized}/`; the earlier
-`data/babylm2026_maskeddlm/` directory was only a comparison artifact.
+The challenge budget is checked on the untouched official rows before
+normalization. The manifest separately records normalized usable words and
+control-only rows removed from tokenization, so packing and steps are derived
+from the actual token stream without adding replacement text. The canonical
+paths are `data/2026_10M/` and `data/2026_100M/`. Schema-v2 manifests also
+record tokens/word, emitted and low-frequency vocabulary counts, zero-UNK
+status, storage metadata, artifact sizes/hashes, and the exact dataloader and
+optimizer steps. SHA-256 is computed during preparation; training startup uses
+the manifest and file sizes and does not rescan the raw corpus.
 
 Current status:
 
@@ -330,9 +343,9 @@ Official BabyLM evaluation:
   -> used by the official MLM backend/checkpoint revisions
 
 Diagnostic ELF generation:
-  BabyLMELFForMaskedLM.generate(...)
+  BabyLMELFForMaskedLM.diagnostic_generate(...)
   -> Gaussian noise -> ODE/SDE continuous denoising -> final decode
-  -> qualitative/debugging signal only, not the official BabyLM score
+  -> optional qualitative/debugging signal only, not the official BabyLM score
 ```
 
 ## 5. Component Sources
@@ -394,26 +407,21 @@ babylm-ELF/
 ├── project.md
 │
 ├── configs/
-│   ├── 2025.yml
-│   ├── 2026_100M_adamW.yml
-│   ├── 2026_100M_muon.yml
-│   ├── 2026_10M_adamW.yml
-│   ├── 2026_10M_muon.yml
+│   ├── 2026_100M_encoder.yml
+│   ├── 2026_100M_learnable_oneperseg_len16_40_filter_punct_ctrl_s0_seq128_bert_head_scaled_gb256_4gpu.yml
+│   ├── 2026_10M_encoder.yml
+│   ├── 2026_10M_encoder_1ep.yml
+│   ├── 2026_10M_learnable.yml
+│   ├── 2026_10M_gaussian.yml
+│   ├── 2026_10M_joint_encoder.yml
+│   ├── 2026_10M_scratch_encoder.yml
 │   └── smoke.yml
 │
 ├── scripts/
-│   ├── prepare_2025.sh
-│   ├── prepare_2026_100M.sh
-│   ├── prepare_2026_10M.sh
-│   ├── train_2025.sh
-│   ├── train_2026_100M.sh
-│   ├── train_2026_10M.sh
-│   ├── export_2025_hf.sh
-│   ├── export_2026_100M_hf.sh
-│   ├── export_2026_10M_hf.sh
-│   └── slurm/
-│       ├── train_2025.slurm
-│       └── train_2026_100M_adamW.slurm
+│   ├── prepare/
+│   ├── train/
+│   ├── export/
+│   └── diagnostics/
 │
 ├── babylm_elf/
 │   ├── cli/
@@ -488,6 +496,10 @@ babylm_elf/training/
 babylm_elf/export/
   Conversion from training checkpoints to Hugging Face-compatible artifacts
   for later use in the official BabyLM evaluation repository.
+
+babylm_elf/cli/diagnose_generation.py
+  Optional debug script for open-ended ELF samples and denoising reports.
+  It is not part of the main training/export/evaluation path.
 ```
 
 Non-target components:
@@ -532,57 +544,41 @@ outputs/2026_10M/{adamW,muon}/checkpoints/
 outputs/2026_10M/{adamW,muon}/hf/
 ```
 
-Smoke test:
+BabyLM 2026 Strict-Small 10M main comparison:
 
 ```bash
-scripts/smoke_test.sh
+sbatch scripts/prepare/prepare_2026_10M.slurm
+sbatch scripts/train/train_learnable_2026_10M_oneperseg_len16_40_filter_punct_ctrl_s0_seq128_bert_head_scaled_size33m_gb128_lr5e-4_4gpu.slurm
+bash scripts/export/main/export_2026_10M_learnable_hf.sh
+bash scripts/export/main/export_2026_10M_gaussian_hf.sh
+bash scripts/export/main/export_2026_10M_joint_encoder_hf.sh
+bash scripts/export/main/export_2026_10M_frozen_scratch_encoder_hf.sh
 ```
 
-BabyLM 2025 run:
+The main 10M comparison now uses learned-latent token-mask decode CE: 20%
+decode CE and 80% denoising MSE with segment-aware Bernoulli masking on
+128-token packed sequences. Each CE row stays as one row; the sampler selects
+one or more eligible positions in that row, replaces those positions with the
+same checkpoint-owned continuous mask latent used by HF MLM eval, then runs
+ELF decode mode at `t=1` with unembed logits and masked-position CE. The
+latent is initialized from embedding statistics, then learned with the model.
+Training does not imitate the official scoring loop's sequential position traversal.
+Optimizer settings are Muon lr
+`3.5e-4`, AuxAdam lr `1e-4`, cosine decay, min lr `3.5e-5`, batch size 32,
+and gradient accumulation 8.
+
+Previous random-mask MLM CE, CE100/CE90, split runs, and 50/50 decoder-ratio
+jobs are archived comparisons, not maintained training routes.
+The maintained denoise route is the AdamW4e-4 cyclic Step10/20 mainline with
+`denoiser_noise_scale=1.0`. The previous noise-scale-2.0 branch is archived as
+a historical ablation and no longer has public train/export entry points.
+
+BabyLM 2026 Strict 100M run:
 
 ```bash
-python -m babylm_elf.cli.prepare_data --config configs/2025.yml
-python -m babylm_elf.cli.train --config configs/2025.yml
-python -m babylm_elf.cli.export_hf --config configs/2025.yml
-```
-
-BabyLM 2026 run:
-
-```bash
-python -m babylm_elf.cli.prepare_data --config configs/2026_100M_adamW.yml
-python -m babylm_elf.cli.train --config configs/2026_100M_adamW.yml
-python -m babylm_elf.cli.export_hf --config configs/2026_100M_adamW.yml --all-revisions
-```
-
-BabyLM 2026 Strict-Small 10M run:
-
-```bash
-python -m babylm_elf.cli.prepare_data --config configs/2026_10M_adamW.yml
-python -m babylm_elf.cli.train --config configs/2026_10M_adamW.yml
-python -m babylm_elf.cli.export_hf --config configs/2026_10M_adamW.yml --all-revisions
-```
-
-Shell wrappers:
-
-```bash
-scripts/prepare_2025.sh
-scripts/train_2025.sh
-scripts/export_2025_hf.sh
-
-scripts/prepare_2026_100M.sh
-scripts/prepare_2026_10M.sh
-scripts/train_2026_100M.sh
-scripts/train_2026_10M.sh
-scripts/export_2026_100M_hf.sh
-scripts/export_2026_10M_hf.sh
-```
-
-SLURM training:
-
-```bash
-sbatch scripts/slurm/train_2025.slurm
-sbatch scripts/slurm/train_2026_100M_adamW.slurm
-sbatch scripts/slurm/train_2026_10M_adamW.slurm
+sbatch scripts/prepare/prepare_2026_100M.slurm
+sbatch scripts/train/train_learnable_2026_100M_oneperseg_len16_40_filter_punct_ctrl_s0_seq128_bert_head_scaled_gb256_4gpu.slurm
+bash scripts/export/main/export_2026_100M_hf.sh
 ```
 
 ## 8. Training Plan
@@ -660,10 +656,17 @@ no shape mismatch in embedding -> noise -> denoise -> decode
 2026 ELF small run:
   data year: 2026
   data size: Strict-Small 10M
-  status: configured; data preparation and training pending
+  status: seq128 token-mask MLM CE20 route with p/max mask sweeps
   tokenizer: trained from scratch on Strict-Small only
-  objective: elf_flow
+  objective: token_mlm token-mask decode CE plus denoise MSE
+  seq_length: 128
+  batch_size: 32
+  gradient_accumulation_steps: 8
   decoder_probability: 0.2
+  mlm_mask_strategy: bernoulli
+  mlm_min_masks_per_seq: 1
+  mlm_max_masks_per_seq: configured by run
+  optimizer: Muon lr 3.5e-4, AuxAdam lr 1e-4, cosine schedule to 3.5e-5
   EMA: enabled
   mixed precision: enabled if stable
 ```
@@ -684,12 +687,13 @@ BabyLM 2026 10M / STRICT-SMALL:
 The 2026 full-run configs enable `checkpoint_by_words: true`, so checkpoint
 targets are based on estimated whitespace-word exposure rather than raw training
 steps. Each checkpoint includes metadata with `words_seen`, `target_words`, and
-`steps_per_epoch`. BabyLM-required checkpoints are model-only to keep outputs
-compact. No duplicate `final.pt` or periodic step checkpoints are written for
-word-checkpoint runs. All checkpoint files use temporary-file writes followed
-by atomic replacement, so an interrupted save cannot replace a valid checkpoint
-with a partial file.
-Export automatically selects the official checkpoint with the largest exposure.
+`steps_per_epoch`, plus the EMA and RNG settings. BabyLM-required checkpoints
+store both raw and EMA model weights. No duplicate `final.pt` or periodic step
+checkpoints are written for word-checkpoint runs. All checkpoint files use
+temporary-file writes followed by atomic replacement, so an interrupted save
+cannot replace a valid checkpoint with a partial file. Export automatically
+selects the official checkpoint with the largest exposure and uses EMA unless
+`--weights raw` is requested explicitly.
 
 ## 9. Export and Evaluation
 
@@ -730,22 +734,22 @@ exp2026_10M_elf: BabyLM-ELF run with BabyLM 2026 Strict-Small 10M data
 Current 2026 experiment settings:
 
 ```text
-config:       configs/2026_100M_adamW.yml
-test config:  configs/2026_100M_adamW.yml
+config:       configs/2026_100M_learnable_oneperseg_len16_40_filter_punct_ctrl_s0_seq128_bert_head_scaled_gb256_4gpu.yml
 tokenizer:    data/2026_100M/tokenizer/tokenizer.json
 tokenized:    data/2026_100M/tokenized/train_100M.bin
-seq_length:   1024
+seq_length:   128
+global_batch: 256
 ```
 
 2026 Strict-Small 10M settings:
 
 ```text
 dataset:      BabyLM-community/BabyLM-2026-Strict-Small
-config:       configs/2026_10M_adamW.yml
-test config:  configs/2026_10M_adamW.yml
+configs:      configs/2026_10M_{learnable,gaussian,joint_encoder,scratch_encoder}.yml
+encoders:     configs/2026_10M_encoder.yml and configs/2026_10M_encoder_1ep.yml
 tokenizer:    data/2026_10M/tokenizer/tokenizer.json
 tokenized:    data/2026_10M/tokenized/train_10M.bin
-seq_length:   1024
+seq_length:   128
 ```
 
 Their evaluation scores are produced later with the matching official BabyLM evaluation repository.

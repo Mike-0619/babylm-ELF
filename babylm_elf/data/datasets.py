@@ -1,84 +1,67 @@
 from __future__ import annotations
 
-from pathlib import Path
-from bisect import bisect_right
 import math
+from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 
 from babylm_elf.data.collate import collate_tokenized_batch
+from babylm_elf.data.schema import DISTRIBUTED_SAMPLER_DROP_LAST
+from babylm_elf.data.token_stream import open_token_stream
 
 
 class TokenizedTextDataset(Dataset):
-    """Fixed-length chunks from torch-saved tokenized documents."""
+    """Fixed-length views over one memory-mapped flat int16 token stream."""
 
     def __init__(
         self,
         path: str | Path,
         seq_length: int,
-        cls_token_id: int,
         pad_token_id: int,
+        drop_incomplete: bool = False,
     ) -> None:
+        if seq_length <= 0:
+            raise ValueError(f"seq_length must be positive, got {seq_length}.")
         self.path = Path(path)
         self.seq_length = seq_length
-        self.cls_token_id = cls_token_id
         self.pad_token_id = pad_token_id
-        documents = torch.load(self.path, map_location="cpu", weights_only=True)
-        self.documents = [document for document in documents if document.numel() > 0]
-        self.cumulative_ends: list[int] = []
-        total = 0
-        for document in self.documents:
-            total += 1 + document.numel()
-            self.cumulative_ends.append(total)
-        self.total_tokens = total
-        if self.total_tokens == 0:
-            raise ValueError(f"No usable token segments found in {self.path}")
+        self.drop_incomplete = drop_incomplete
+        self.stream = open_token_stream(self.path)
+        self.total_tokens = self.stream.numel()
+        self.total_chunks = (
+            self.total_tokens // self.seq_length
+            if self.drop_incomplete
+            else math.ceil(self.total_tokens / self.seq_length)
+        )
+        if self.total_chunks == 0:
+            raise ValueError(
+                f"No full {self.seq_length}-token chunks found in {self.path}"
+            )
 
     def __len__(self) -> int:
-        return math.ceil(self.total_tokens / self.seq_length)
+        return self.total_chunks
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         if index < 0 or index >= len(self):
             raise IndexError(index)
-        input_ids = self._read_stream(index * self.seq_length, self.seq_length)
-        attention_mask = torch.ones_like(input_ids)
+        start = index * self.seq_length
+        input_ids = self.stream[start : start + self.seq_length].long()
+        attention_mask = torch.ones(input_ids.numel(), dtype=torch.long)
         pad_len = self.seq_length - input_ids.numel()
         if pad_len > 0:
             input_ids = torch.cat(
                 [input_ids, input_ids.new_full((pad_len,), self.pad_token_id)]
             )
-            attention_mask = torch.cat([attention_mask, attention_mask.new_zeros(pad_len)])
-        return {"input_ids": input_ids.long(), "attention_mask": attention_mask.long()}
-
-    def _read_stream(self, start: int, length: int) -> torch.Tensor:
-        document_index = bisect_right(self.cumulative_ends, start)
-        previous_end = self.cumulative_ends[document_index - 1] if document_index else 0
-        offset = start - previous_end
-        chunks: list[torch.Tensor] = []
-        remaining = min(length, self.total_tokens - start)
-
-        while remaining > 0:
-            document = self.documents[document_index]
-            if offset == 0:
-                chunks.append(torch.tensor([self.cls_token_id], dtype=torch.long))
-                remaining -= 1
-                offset = 1
-                if remaining == 0:
-                    break
-
-            document_offset = offset - 1
-            take = min(remaining, document.numel() - document_offset)
-            if take > 0:
-                chunks.append(document[document_offset : document_offset + take])
-                remaining -= take
-                offset += take
-
-            if offset >= document.numel() + 1:
-                document_index += 1
-                offset = 0
-
-        return torch.cat(chunks)
+            attention_mask = torch.cat(
+                [attention_mask, attention_mask.new_zeros(pad_len)]
+            )
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "sequence_id": torch.tensor(index, dtype=torch.long),
+        }
 
 
 def build_dataloader(
@@ -89,20 +72,42 @@ def build_dataloader(
     shuffle: bool,
     num_workers: int = 0,
     generator: torch.Generator | None = None,
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
+    seed: int = 0,
+    drop_incomplete: bool = False,
 ) -> DataLoader:
-    cls_token_id = _required_token_id(tokenizer, "<s>")
+    _required_token_id(tokenizer, "<s>")
     pad_token_id = _required_token_id(tokenizer, "<pad>")
-    dataset = TokenizedTextDataset(path, seq_length, cls_token_id, pad_token_id)
+    dataset = TokenizedTextDataset(
+        path,
+        seq_length,
+        pad_token_id,
+        drop_incomplete=drop_incomplete,
+    )
+    sampler = None
+    if distributed:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=shuffle,
+            seed=seed,
+            # Never pad a rank with repeated chunks. If the number of chunks is
+            # not divisible by world size, a shuffled remainder is omitted and
+            # rotates across epochs through DistributedSampler.set_epoch().
+            drop_last=DISTRIBUTED_SAMPLER_DROP_LAST,
+        )
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=shuffle if sampler is None else False,
+        sampler=sampler,
         num_workers=num_workers,
         collate_fn=collate_tokenized_batch,
         pin_memory=torch.cuda.is_available(),
-        generator=generator,
-        # BabyLM exposure is counted in full corpus passes. Keep the final
-        # partial batch so one epoch always covers the complete train corpus.
+        generator=generator if sampler is None else None,
         drop_last=False,
     )
 
@@ -111,43 +116,4 @@ def _required_token_id(tokenizer, token: str) -> int:
     token_id = tokenizer.token_to_id(token)
     if token_id is None:
         raise ValueError(f"Tokenizer is missing required token: {token}")
-    return token_id
-
-
-def export_hf_split_to_text(
-    dataset_name: str,
-    split: str,
-    output_path: str | Path,
-    text_field: str = "text",
-    config_name: str | None = None,
-) -> None:
-    """Materialize one Hugging Face dataset split as paragraph-separated text."""
-    try:
-        from datasets import load_dataset
-    except ImportError as exc:
-        raise RuntimeError(
-            "Install the 'datasets' package to prepare Hugging Face BabyLM data."
-        ) from exc
-
-    if not dataset_name:
-        raise ValueError("Set data.hf_dataset before preparing a Hugging Face source.")
-
-    dataset = load_dataset(dataset_name, config_name, split=split)
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    count = 0
-    with output_path.open("w", encoding="utf-8") as handle:
-        for row in dataset:
-            if text_field not in row:
-                raise ValueError(
-                    f"Field '{text_field}' was not found in dataset row. "
-                    f"Available fields: {sorted(row.keys())}"
-                )
-            text = str(row[text_field]).strip()
-            if not text:
-                continue
-            handle.write(text)
-            handle.write("\n\n")
-            count += 1
-    print(f"Saved {count} Hugging Face rows from {dataset_name}:{split} to {output_path}")
+    return int(token_id)

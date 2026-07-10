@@ -8,6 +8,7 @@ __pycache__/
 # Training logs and outputs
 /logs/
 /outputs/
+/.cache/
 *.pt
 *.pth
 *.ckpt

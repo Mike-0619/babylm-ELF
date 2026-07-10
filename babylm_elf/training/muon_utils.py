@@ -8,10 +8,13 @@ import torch.nn as nn
 def muon_with_aux_adam(
     model: nn.Module,
     lr: float,
+    aux_lr: float | None = None,
+    encoder_lr_multiplier: float = 1.0,
     betas: tuple[float, float] = (0.9, 0.999),
     eps: float = 1e-8,
 ) -> torch.optim.Optimizer:
     """ELF-style Muon optimizer: 2D params use Muon, others use auxiliary Adam."""
+    aux_lr = lr if aux_lr is None else aux_lr
     try:
         import muon as _muon_module
         from muon import MuonWithAuxAdam, SingleDeviceMuonWithAuxAdam
@@ -72,15 +75,24 @@ def muon_with_aux_adam(
 
     muon_params = []
     adam_params = []
+    encoder_muon_params = []
+    encoder_adam_params = []
     muon_flax_layout = {}
-    for _, param in model.named_parameters():
+    for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
+        is_encoder = name.startswith("scratch_encoder.")
         if param.ndim == 2:
-            muon_params.append(param)
+            if is_encoder:
+                encoder_muon_params.append(param)
+            else:
+                muon_params.append(param)
             muon_flax_layout[id(param)] = id(param) not in linear_weight_ids
         else:
-            adam_params.append(param)
+            if is_encoder:
+                encoder_adam_params.append(param)
+            else:
+                adam_params.append(param)
 
     distributed = dist.is_available() and dist.is_initialized()
     base_cls = MuonWithAuxAdam if distributed else SingleDeviceMuonWithAuxAdam
@@ -148,21 +160,60 @@ def muon_with_aux_adam(
             param.mul_(1 - group["lr"] * group["weight_decay"])
             param.add_(update, alpha=-group["lr"])
 
-    param_groups = [
-        {"params": muon_params, "lr": lr, "momentum": 0.95, "weight_decay": 0.0, "use_muon": True},
-        {
-            "params": adam_params,
-            "lr": lr,
-            "betas": betas,
-            "eps": eps,
-            "weight_decay": 0.0,
-            "use_muon": False,
-        },
-    ]
+    encoder_lr = lr * encoder_lr_multiplier
+    encoder_aux_lr = aux_lr * encoder_lr_multiplier
+    param_groups = []
+    if muon_params:
+        param_groups.append(
+            {
+                "params": muon_params,
+                "lr": lr,
+                "momentum": 0.95,
+                "weight_decay": 0.0,
+                "use_muon": True,
+            }
+        )
+    if adam_params:
+        param_groups.append(
+            {
+                "params": adam_params,
+                "lr": aux_lr,
+                "betas": betas,
+                "eps": eps,
+                "weight_decay": 0.0,
+                "use_muon": False,
+            }
+        )
+    if encoder_muon_params:
+        param_groups.append(
+            {
+                "params": encoder_muon_params,
+                "lr": encoder_lr,
+                "momentum": 0.95,
+                "weight_decay": 0.0,
+                "use_muon": True,
+            }
+        )
+    if encoder_adam_params:
+        param_groups.append(
+            {
+                "params": encoder_adam_params,
+                "lr": encoder_aux_lr,
+                "betas": betas,
+                "eps": eps,
+                "weight_decay": 0.0,
+                "use_muon": False,
+            }
+        )
     print(
         "Using MuonWithAuxAdam: "
-        f"{len(muon_params)} 2D params use Muon; "
-        f"{len(adam_params)} other params use Nesterov-Adam "
-        f"(lr={lr:g}, betas={betas}, eps={eps:g}, weight_decay=0)"
+        f"{len(muon_params)} non-encoder 2D params use Muon; "
+        f"{len(adam_params)} non-encoder other params use Nesterov-Adam; "
+        f"{len(encoder_muon_params)} encoder 2D params use Muon; "
+        f"{len(encoder_adam_params)} encoder other params use Nesterov-Adam "
+        f"(muon_lr={lr:g}, aux_lr={aux_lr:g}, "
+        f"encoder_muon_lr={encoder_lr:g}, encoder_aux_lr={encoder_aux_lr:g}, "
+        f"betas={betas}, "
+        f"eps={eps:g}, weight_decay=0)"
     )
     return _SafeMuonWithAuxAdam(param_groups)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -11,6 +12,7 @@ from safetensors.torch import save_file
 from tokenizers import Tokenizer
 
 from babylm_elf.config import TrainConfig
+from babylm_elf.training.checkpointing import ModelWeights, select_model_weights
 
 SPECIAL_TOKENS = {
     "unk_token": "<unk>",
@@ -27,13 +29,15 @@ def export_checkpoint_to_hf(
     checkpoint_path: str | Path,
     output_dir: str | Path,
     config: TrainConfig,
+    *,
+    weights: ModelWeights = "ema",
 ) -> None:
     checkpoint_path = Path(checkpoint_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    model_state = checkpoint.get("model", checkpoint)
+    model_state = select_model_weights(checkpoint, weights=weights)
     safe_state = _dedupe_shared_tensors({
         name: tensor.detach().contiguous()
         for name, tensor in _hf_model_state(model_state).items()
@@ -74,12 +78,7 @@ def export_checkpoint_to_hf(
         "sep_token_id": token_ids["sep_token"],
         "babylm_elf_config": model_config,
         "diffusion_config": _diffusion_config(checkpoint_config, config),
-        "evaluation_config": {
-            "backend": "mlm",
-            "adapter": "mlm_direct",
-            "mc_samples": 1,
-            "seed": config.seed,
-        },
+        "evaluation_config": _evaluation_config(checkpoint_config, config),
         "diagnostic_generation_config": _diagnostic_generation_config(
             checkpoint_config,
             config,
@@ -88,6 +87,7 @@ def export_checkpoint_to_hf(
             checkpoint_config,
             config,
             checkpoint.get("metadata", {}) if isinstance(checkpoint, dict) else {},
+            weights,
         ),
     }
     (output_dir / "config.json").write_text(json.dumps(hf_config, indent=2), encoding="utf-8")
@@ -106,6 +106,15 @@ def _model_config(
         model_config = asdict(config.model)
     else:
         model_config = dict(config.model)
+    diffusion = _diffusion_config(checkpoint_config, config)
+    model_config.setdefault(
+        "mlm_mask_latent_seed",
+        int(diffusion.get("mlm_mask_latent_seed", 0)),
+    )
+    model_config.setdefault(
+        "mlm_mask_latent_scale",
+        float(diffusion.get("mlm_mask_latent_scale", 1.0)),
+    )
 
     vocab_size = _infer_vocab_size(model_state)
     if vocab_size is not None:
@@ -126,6 +135,7 @@ def _training_metadata(
     checkpoint_config: Any,
     config: TrainConfig,
     checkpoint_metadata: dict[str, Any],
+    weights: ModelWeights,
 ) -> dict[str, Any]:
     if isinstance(checkpoint_config, dict):
         data_config = checkpoint_config.get("data", {})
@@ -139,6 +149,7 @@ def _training_metadata(
                 "word_exposure_offset",
                 config.word_exposure_offset,
             ),
+            "weights_variant": weights,
             "checkpoint_metadata": dict(checkpoint_metadata),
         }
     return {
@@ -148,6 +159,7 @@ def _training_metadata(
         "valid_path": str(config.data.valid_path),
         "max_steps": config.max_steps,
         "word_exposure_offset": config.word_exposure_offset,
+        "weights_variant": weights,
         "checkpoint_metadata": dict(checkpoint_metadata),
     }
 
@@ -156,8 +168,28 @@ def _diffusion_config(checkpoint_config: Any, config: TrainConfig) -> dict[str, 
     if isinstance(checkpoint_config, dict) and isinstance(
         checkpoint_config.get("diffusion"), dict
     ):
-        return dict(checkpoint_config["diffusion"])
-    return asdict(config.diffusion) if is_dataclass(config.diffusion) else dict(config.diffusion)
+        diffusion = dict(checkpoint_config["diffusion"])
+    else:
+        diffusion = asdict(config.diffusion) if is_dataclass(config.diffusion) else dict(config.diffusion)
+    return diffusion
+
+
+def _evaluation_config(checkpoint_config: Any, config: TrainConfig) -> dict[str, Any]:
+    diffusion = _diffusion_config(checkpoint_config, config)
+    adapter = diffusion.get("mlm_eval_adapter", "mlm_mask_latent")
+    if adapter != "mlm_mask_latent":
+        raise ValueError(
+            "BabyLM-ELF exports only support diffusion.mlm_eval_adapter="
+            f"'mlm_mask_latent'; got {adapter!r}."
+        )
+    return {
+        "backend": "mlm",
+        "adapter": "mlm_mask_latent",
+        "mc_samples": 1,
+        "seed": config.seed,
+        "mask_latent_seed": int(diffusion.get("mlm_mask_latent_seed", 0)),
+        "mask_latent_scale": float(diffusion.get("mlm_mask_latent_scale", 1.0)),
+    }
 
 
 def _diagnostic_generation_config(
@@ -166,7 +198,7 @@ def _diagnostic_generation_config(
 ) -> dict[str, Any]:
     diffusion = _diffusion_config(checkpoint_config, config)
     return {
-        "purpose": "open_ended_diagnostic_not_babylm_official_scoring",
+        "purpose": "optional_debug_only_not_babylm_official_scoring",
         "sampling_method": "sde",
         "num_steps": 64,
         "time_schedule": diffusion.get("time_schedule", "logit_normal"),
@@ -176,18 +208,18 @@ def _diagnostic_generation_config(
 
 
 def _infer_vocab_size(model_state: dict[str, torch.Tensor]) -> int | None:
-    for key in (
-        "unembed_kernel",
-        "babylm_elf.unembed_kernel",
-    ):
+    for key in ("codebook.weight", "babylm_elf.codebook.weight"):
         weight = model_state.get(key)
         if weight is not None:
             return int(weight.shape[1])
-    for key in ("decoder_bias", "babylm_elf.decoder_bias"):
+    for key in ("codebook.bias", "babylm_elf.codebook.bias"):
         bias = model_state.get(key)
         if bias is not None:
             return int(bias.shape[0])
-    for key in ("token_embedding.weight", "babylm_elf.token_embedding.weight"):
+    for key in (
+        "codebook.embedding.weight",
+        "babylm_elf.codebook.embedding.weight",
+    ):
         weight = model_state.get(key)
         if weight is not None:
             return int(weight.shape[0])
@@ -253,9 +285,13 @@ def _write_tokenizer_metadata(
             raise ValueError(f"Tokenizer is missing required {role}: {token}")
         token_ids[role] = token_id
 
+    export_model_max_length = max(
+        model_max_length,
+        int(os.environ.get("BABYLM_ELF_EXPORT_TOKENIZER_MAX_LENGTH", model_max_length)),
+    )
     tokenizer_config = {
         "tokenizer_class": "PreTrainedTokenizerFast",
-        "model_max_length": model_max_length,
+        "model_max_length": export_model_max_length,
         "padding_side": "right",
         "truncation_side": "right",
         **SPECIAL_TOKENS,
@@ -277,4 +313,30 @@ def _copy_export_code(output_dir: Path) -> None:
     shutil.copy2(package_root / "export" / "hf_config.py", output_dir / "configuration_babylm_elf.py")
     shutil.copy2(package_root / "export" / "hf_model.py", output_dir / "modeling_babylm_elf.py")
     shutil.copy2(package_root / "modeling" / "model.py", output_dir / "modeling_core.py")
-    shutil.copy2(package_root / "modeling" / "layers.py", output_dir / "layers.py")
+    shutil.copy2(package_root / "modeling" / "codebook.py", output_dir / "codebook.py")
+    shutil.copy2(package_root / "modeling" / "mask_latent.py", output_dir / "mask_latent.py")
+    shutil.copy2(package_root / "modeling" / "positions.py", output_dir / "positions.py")
+    layers_source = (package_root / "modeling" / "layers.py").read_text(encoding="utf-8")
+    layers_source = layers_source.replace(
+        "try:\n"
+        "    from .sdpa import sdpa_attention\n"
+        "except ImportError:\n"
+        "    from babylm_elf.modeling.sdpa import sdpa_attention\n",
+        "def sdpa_attention(\n"
+        "    query: torch.Tensor,\n"
+        "    key: torch.Tensor,\n"
+        "    value: torch.Tensor,\n"
+        "    *,\n"
+        "    attn_mask: torch.Tensor | None,\n"
+        "    dropout_p: float,\n"
+        ") -> torch.Tensor:\n"
+        "    return F.scaled_dot_product_attention(\n"
+        "        query,\n"
+        "        key,\n"
+        "        value,\n"
+        "        attn_mask=attn_mask,\n"
+        "        dropout_p=dropout_p,\n"
+        "    )\n",
+    )
+    (output_dir / "layers.py").write_text(layers_source, encoding="utf-8")
+    shutil.copy2(package_root / "modeling" / "sdpa.py", output_dir / "sdpa.py")

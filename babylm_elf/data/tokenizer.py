@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Iterable
 
 from tokenizers import Regex, Tokenizer, decoders, normalizers, pre_tokenizers, processors
 from tokenizers.models import BPE
 from tokenizers.trainers import BpeTrainer
+
+from babylm_elf.data.text import iter_documents
 
 
 SPECIAL_TOKENS = ["<unk>", "<s>", "</s>", "<pad>", "<mask>"] + [
@@ -30,7 +31,7 @@ def train_bpe_tokenizer(
         initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
         show_progress=True,
     )
-    iterator = _raw_line_iterator(Path(input_path))
+    iterator = iter_documents(Path(input_path))
     tokenizer.train_from_iterator(iterator, trainer)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -103,10 +104,3 @@ def _strip_byte_alphabet_added_tokens(path: Path) -> None:
         tokenizer_json["added_tokens"] = added_tokens[:-256]
     with path.open("w", encoding="utf-8") as handle:
         json.dump(tokenizer_json, handle, ensure_ascii=False, indent=4)
-
-
-def _raw_line_iterator(path: Path) -> Iterable[str]:
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            if len(line) > 0:
-                yield line
