@@ -19,6 +19,26 @@ def unwrap_model(model):
     return getattr(model, "module", model)
 
 
+def _forward_model(
+    model,
+    x: torch.Tensor,
+    t: torch.Tensor,
+    *,
+    attention_mask: torch.Tensor,
+    segment_ids: torch.Tensor | None,
+    self_cond_cfg_scale: torch.Tensor,
+    decoder_step_active: torch.Tensor,
+):
+    kwargs = {
+        "attention_mask": attention_mask,
+        "self_cond_cfg_scale": self_cond_cfg_scale,
+        "decoder_step_active": decoder_step_active,
+    }
+    if segment_ids is not None:
+        kwargs["segment_ids"] = segment_ids
+    return model(x, t, **kwargs)
+
+
 def make_target_mask(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
@@ -46,8 +66,8 @@ def train_step(
 ) -> StepOutput:
     input_ids = batch["input_ids"]
     attention_mask = batch["attention_mask"]
+    segment_ids = batch.get("segment_ids")
     sequence_ids = batch.get("sequence_id")
-    valid_mask = attention_mask.to(torch.float32)
     decoder_objective = getattr(config, "decoder_objective", "token_mlm")
     if decoder_objective != "token_mlm":
         raise ValueError(
@@ -59,8 +79,8 @@ def train_step(
         model,
         input_ids,
         attention_mask,
-        valid_mask,
         config,
+        segment_ids=segment_ids,
         sequence_ids=sequence_ids,
         current_epoch=current_epoch,
     )
@@ -70,15 +90,20 @@ def train_step_token_mlm(
     model,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
-    valid_mask: torch.Tensor,
     config,
     *,
+    segment_ids: torch.Tensor | None = None,
     sequence_ids: torch.Tensor | None = None,
     current_epoch: int = 0,
 ) -> StepOutput:
     batch_size = input_ids.size(0)
     device = input_ids.device
     base_model = unwrap_model(model)
+    lexical_target_mask = make_target_mask(
+        input_ids,
+        attention_mask,
+        special_token_count=config.mlm_special_token_count,
+    )
     decoder_target_mask = make_target_mask(
         input_ids,
         attention_mask,
@@ -93,6 +118,7 @@ def train_step_token_mlm(
             input_ids,
             attention_mask,
             config,
+            segment_ids=segment_ids,
             sequence_ids=sequence_ids,
             current_epoch=current_epoch,
         )
@@ -148,6 +174,11 @@ def train_step_token_mlm(
             0,
             self_condition_rows,
         )
+        self_condition_segments = (
+            segment_ids.index_select(0, self_condition_rows)
+            if segment_ids is not None
+            else None
+        )
         self_condition_cfg = cfg_scale.index_select(0, self_condition_rows)
         auxiliary_decoder_active = torch.zeros(
             self_condition_rows.numel(),
@@ -155,13 +186,15 @@ def train_step_token_mlm(
             dtype=dtype,
         )
         with torch.no_grad():
-            unconditioned_prediction, _ = base_model(
+            unconditioned_prediction, _ = _forward_model(
+                base_model,
                 torch.cat(
                     (self_condition_z, torch.zeros_like(self_condition_z)),
                     dim=-1,
                 ),
                 self_condition_t,
                 attention_mask=self_condition_attention,
+                segment_ids=self_condition_segments,
                 self_cond_cfg_scale=self_condition_cfg,
                 decoder_step_active=auxiliary_decoder_active,
             )
@@ -171,10 +204,12 @@ def train_step_token_mlm(
                 self_condition_t,
                 config.t_eps,
             )
-            conditioned_prediction, _ = base_model(
+            conditioned_prediction, _ = _forward_model(
+                base_model,
                 torch.cat((self_condition_z, unconditioned_prediction), dim=-1),
                 self_condition_t,
                 attention_mask=self_condition_attention,
+                segment_ids=self_condition_segments,
                 self_cond_cfg_scale=self_condition_cfg,
                 decoder_step_active=auxiliary_decoder_active,
             )
@@ -200,6 +235,7 @@ def train_step_token_mlm(
     self_condition_parts: list[torch.Tensor] = []
     t_parts: list[torch.Tensor] = []
     attention_parts: list[torch.Tensor] = []
+    segment_parts: list[torch.Tensor] = []
     cfg_parts: list[torch.Tensor] = []
     decoder_active_parts: list[torch.Tensor] = []
 
@@ -217,7 +253,7 @@ def train_step_token_mlm(
             ce_token_mask,
             decoder_target_ids,
             decoder_attention_mask,
-            _,
+            selected_decoder_rows,
         ) = build_mlm_decoder_inputs(
             model,
             input_ids.index_select(0, decoder_rows),
@@ -232,10 +268,18 @@ def train_step_token_mlm(
         )
         decoder_count = decoder_z.size(0)
         if decoder_count > 0:
+            selected_global_rows = decoder_rows.index_select(
+                0,
+                selected_decoder_rows,
+            )
             z_parts.append(decoder_z)
             self_condition_parts.append(torch.zeros_like(decoder_z))
             t_parts.append(torch.ones(decoder_count, device=device, dtype=dtype))
             attention_parts.append(decoder_attention_mask)
+            if segment_ids is not None:
+                segment_parts.append(
+                    segment_ids.index_select(0, selected_global_rows)
+                )
             cfg_parts.append(torch.ones(decoder_count, device=device, dtype=dtype))
             decoder_active_parts.append(
                 torch.ones(decoder_count, device=device, dtype=dtype)
@@ -246,6 +290,8 @@ def train_step_token_mlm(
         self_condition_parts.append(self_condition.index_select(0, denoiser_rows))
         t_parts.append(t.index_select(0, denoiser_rows))
         attention_parts.append(attention_mask.index_select(0, denoiser_rows))
+        if segment_ids is not None:
+            segment_parts.append(segment_ids.index_select(0, denoiser_rows))
         cfg_parts.append(cfg_scale.index_select(0, denoiser_rows))
         decoder_active_parts.append(
             torch.zeros(denoiser_rows.numel(), device=device, dtype=dtype)
@@ -268,13 +314,18 @@ def train_step_token_mlm(
     mixed_self_condition = torch.cat(self_condition_parts, dim=0)
     mixed_t = torch.cat(t_parts, dim=0)
     mixed_attention_mask = torch.cat(attention_parts, dim=0)
+    mixed_segment_ids = (
+        torch.cat(segment_parts, dim=0) if segment_ids is not None else None
+    )
     mixed_cfg_scale = torch.cat(cfg_parts, dim=0)
     mixed_decoder_active = torch.cat(decoder_active_parts, dim=0)
 
-    prediction, decoder_logits = model(
+    prediction, decoder_logits = _forward_model(
+        model,
         torch.cat((mixed_z, mixed_self_condition), dim=-1),
         mixed_t,
         attention_mask=mixed_attention_mask,
+        segment_ids=mixed_segment_ids,
         self_cond_cfg_scale=mixed_cfg_scale,
         decoder_step_active=mixed_decoder_active,
     )
@@ -304,20 +355,17 @@ def train_step_token_mlm(
             predicted_velocity
             - velocity_target.index_select(0, denoiser_rows).detach()
         ).square().mean(dim=-1)
-        flow_target_mask = make_target_mask(
-            input_ids,
-            attention_mask,
-            special_token_count=config.mlm_special_token_count,
-        ).to(torch.float32)
+        flow_target_mask = lexical_target_mask.to(torch.float32)
         l2_mask = flow_target_mask.index_select(0, denoiser_rows)
         flow = (l2_per_token * l2_mask).sum() / l2_mask.sum().clamp_min(1.0)
     else:
         flow = zero_from_forward
 
+    lexical_mask = lexical_target_mask.to(torch.float32)
     decoder_mask_2d = decoder_active.view(-1, 1)
-    decoder_valid_mask = valid_mask * decoder_mask_2d
-    l2_mask_original = valid_mask * (1.0 - decoder_mask_2d)
-    denominator = valid_mask.sum().clamp_min(1.0)
+    decoder_valid_mask = lexical_mask * decoder_mask_2d
+    l2_mask_original = lexical_mask * (1.0 - decoder_mask_2d)
+    denominator = lexical_mask.sum().clamp_min(1.0)
     decoder_weight = decoder_valid_mask.sum() / denominator
     flow_weight = l2_mask_original.sum() / denominator
     loss = ce * decoder_weight + flow * flow_weight
@@ -340,6 +388,7 @@ def run_decoder_only_step(
     attention_mask: torch.Tensor,
     config,
     *,
+    segment_ids: torch.Tensor | None = None,
     sequence_ids: torch.Tensor | None = None,
     current_epoch: int = 0,
 ) -> StepOutput:
@@ -349,7 +398,7 @@ def run_decoder_only_step(
         ce_token_mask,
         decoder_target_ids,
         decoder_attention_mask,
-        _,
+        row_indices,
     ) = build_mlm_decoder_inputs(
         model,
         input_ids,
@@ -373,10 +422,17 @@ def run_decoder_only_step(
 
     dtype = decoder_z.dtype
     decoder_active = torch.ones(decoder_z.size(0), device=device, dtype=dtype)
-    _, decoder_logits = model(
+    decoder_segment_ids = (
+        segment_ids.index_select(0, row_indices)
+        if segment_ids is not None
+        else None
+    )
+    _, decoder_logits = _forward_model(
+        model,
         torch.cat((decoder_z, torch.zeros_like(decoder_z)), dim=-1),
         torch.ones_like(decoder_active),
         attention_mask=decoder_attention_mask,
+        segment_ids=decoder_segment_ids,
         self_cond_cfg_scale=torch.ones_like(decoder_active),
         decoder_step_active=decoder_active,
     )

@@ -66,6 +66,26 @@ def _smoke_config(config_path: Path, rank: int, world_size: int) -> dict:
             f"{config_path}: rank {rank} batch shape "
             f"{tuple(batch['input_ids'].shape)} != {expected_shape}."
         )
+    if tuple(batch["segment_ids"].shape) != expected_shape:
+        raise ValueError(
+            f"{config_path}: rank {rank} segment shape "
+            f"{tuple(batch['segment_ids'].shape)} != {expected_shape}."
+        )
+    active = batch["attention_mask"].bool()
+    if (batch["segment_ids"][active] < 0).any():
+        raise ValueError(f"{config_path}: active tokens have invalid segment IDs.")
+    if (batch["segment_ids"][~active] != -1).any():
+        raise ValueError(f"{config_path}: padding tokens must use segment ID -1.")
+    epoch_zero_offset = loader.dataset.epoch_offset
+    loader.dataset.set_epoch(1)
+    epoch_one_offset = loader.dataset.epoch_offset
+    offset_slack = (
+        loader.dataset.total_tokens
+        - loader.dataset.total_chunks * loader.dataset.seq_length
+    )
+    if offset_slack and epoch_one_offset == epoch_zero_offset:
+        raise ValueError(f"{config_path}: epoch-wise packing offset did not advance.")
+    loader.dataset.set_epoch(0)
     return {
         "config": str(config_path),
         "rank": rank,
@@ -73,6 +93,8 @@ def _smoke_config(config_path: Path, rank: int, world_size: int) -> dict:
         "batches": len(loader),
         "batch_shape": list(batch["input_ids"].shape),
         "input_dtype": str(batch["input_ids"].dtype),
+        "segment_dtype": str(batch["segment_ids"].dtype),
+        "epoch_offsets": [epoch_zero_offset, epoch_one_offset],
         "max_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
     }
 

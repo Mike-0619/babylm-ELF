@@ -136,6 +136,18 @@ class CanonicalDataRouteTest(unittest.TestCase):
                 drop_incomplete=True,
             )
             packing = manifest["packing"]
+            self.assertEqual(
+                packing["strategy"],
+                "bos_segmented_epoch_offset_v1",
+            )
+            self.assertEqual(
+                packing["attention_boundary"],
+                "bos_record_block_diagonal",
+            )
+            self.assertEqual(
+                packing["segment_identity"],
+                "usable_official_row_bos",
+            )
             self.assertTrue(packing["distributed_sampler_drop_last"])
             self.assertEqual(packing["distributed_chunks_per_epoch"], 3)
             self.assertEqual(packing["distributed_chunks_dropped_per_epoch"], 0)

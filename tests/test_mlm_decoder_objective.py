@@ -64,10 +64,11 @@ class EchoInputTokenModel(torch.nn.Module):
         x: torch.Tensor,
         t: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        segment_ids: torch.Tensor | None = None,
         self_cond_cfg_scale: torch.Tensor | None = None,
         decoder_step_active: torch.Tensor | bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        del t, attention_mask, decoder_step_active
+        del t, attention_mask, segment_ids, decoder_step_active
         if self_cond_cfg_scale is not None:
             self.seen_cfg_scales.append(self_cond_cfg_scale.detach().cpu())
         self.forward_batch_sizes.append(x.size(0))

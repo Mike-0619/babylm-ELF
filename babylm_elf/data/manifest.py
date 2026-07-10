@@ -23,7 +23,11 @@ from babylm_elf.data.token_stream import (
 )
 
 
-MANIFEST_SCHEMA_VERSION = 2
+MANIFEST_SCHEMA_VERSION = 3
+PACKING_STRATEGY = "bos_segmented_epoch_offset_v1"
+SEGMENT_IDENTITY = "usable_official_row_bos"
+ATTENTION_BOUNDARY = "bos_record_block_diagonal"
+EPOCH_OFFSET_POLICY = "deterministic_within_unexposed_tail"
 
 
 def file_sha256(path: str | Path) -> str:
@@ -59,7 +63,11 @@ def build_data_manifest(
     artifacts: dict[str, dict[str, str | int]],
 ) -> dict[str, Any]:
     stream_tokens = tokenization_stats.stream_tokens
-    chunks = stream_tokens // seq_length
+    chunks = (
+        max(1, (stream_tokens - 1) // seq_length)
+        if stream_tokens >= seq_length
+        else 0
+    )
     if DISTRIBUTED_SAMPLER_DROP_LAST:
         samples_per_rank = chunks // world_size
     else:
@@ -99,6 +107,10 @@ def build_data_manifest(
             "bytes_per_token": TOKEN_BYTES,
         },
         "packing": {
+            "strategy": PACKING_STRATEGY,
+            "segment_identity": SEGMENT_IDENTITY,
+            "attention_boundary": ATTENTION_BOUNDARY,
+            "epoch_offset_policy": EPOCH_OFFSET_POLICY,
             "seq_length": seq_length,
             "drop_incomplete": True,
             "chunks": chunks,
@@ -172,6 +184,7 @@ def validate_training_data_manifest(data_config, tokenizer) -> dict[str, Any]:
     source = manifest.get("source", {})
     normalization = manifest.get("normalization", {})
     tokenization = manifest.get("tokenization", {})
+    packing = manifest.get("packing", {})
     if normalization.get("name") != NORMALIZATION_NAME:
         raise ValueError(
             "Data manifest normalization mismatch: expected "
@@ -194,6 +207,18 @@ def validate_training_data_manifest(data_config, tokenizer) -> dict[str, Any]:
             raise ValueError(
                 f"Token stream {key} mismatch: "
                 f"manifest={tokenization.get(key)!r}, expected={expected!r}."
+            )
+    expected_packing = {
+        "strategy": PACKING_STRATEGY,
+        "segment_identity": SEGMENT_IDENTITY,
+        "attention_boundary": ATTENTION_BOUNDARY,
+        "epoch_offset_policy": EPOCH_OFFSET_POLICY,
+    }
+    for key, expected in expected_packing.items():
+        if packing.get(key) != expected:
+            raise ValueError(
+                f"Data packing {key} mismatch: "
+                f"manifest={packing.get(key)!r}, expected={expected!r}."
             )
 
     vocab_size = tokenizer.get_vocab_size()

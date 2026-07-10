@@ -231,6 +231,7 @@ class BabyLMELF(nn.Module):
         t: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
+        segment_ids: torch.Tensor | None = None,
         self_cond_cfg_scale: torch.Tensor | None = None,
         decoder_step_active: torch.Tensor | bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -238,6 +239,7 @@ class BabyLMELF(nn.Module):
             x,
             t,
             attention_mask=attention_mask,
+            segment_ids=segment_ids,
             position_ids=position_ids,
             self_cond_cfg_scale=self_cond_cfg_scale,
             decoder_step_active=decoder_step_active,
@@ -253,6 +255,7 @@ class BabyLMELF(nn.Module):
         t: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
+        segment_ids: torch.Tensor | None = None,
         self_cond_cfg_scale: torch.Tensor | None = None,
         decoder_step_active: torch.Tensor | bool | None = None,
     ) -> torch.Tensor:
@@ -289,6 +292,7 @@ class BabyLMELF(nn.Module):
             raise RuntimeError("Runtime prefix length does not match model configuration.")
         prepared_attention = self.position_attention(
             attention_mask=attention_mask,
+            segment_ids=segment_ids,
             position_ids=position_ids,
             batch_size=batch,
             text_length=x.size(1) - prefix_length,

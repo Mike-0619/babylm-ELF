@@ -115,7 +115,7 @@ class Attention(nn.Module):
             q,
             k,
             v,
-            attn_mask=attention.padding_mask,
+            attn_mask=attention.attention_mask,
             dropout_p=self.dropout if self.training else 0.0,
         )
         output = output.transpose(1, 2).reshape(batch, length, hidden)

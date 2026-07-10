@@ -8,13 +8,13 @@ import torch.nn as nn
 
 @dataclass(frozen=True)
 class PreparedAttention:
-    padding_mask: torch.Tensor | None
+    attention_mask: torch.Tensor | None
     rope_cos: torch.Tensor
     rope_sin: torch.Tensor
 
 
 class PositionAttention(nn.Module):
-    """Build compact positions, padding mask, and RoPE once per forward."""
+    """Build record-aware positions, attention mask, and RoPE once per forward."""
 
     def __init__(
         self,
@@ -62,6 +62,7 @@ class PositionAttention(nn.Module):
         self,
         *,
         attention_mask: torch.Tensor | None,
+        segment_ids: torch.Tensor | None,
         position_ids: torch.Tensor | None,
         batch_size: int,
         text_length: int,
@@ -79,8 +80,18 @@ class PositionAttention(nn.Module):
             text_length=text_length,
             device=device,
         )
+        segments = self._segments(
+            segment_ids,
+            active,
+            batch_size=batch_size,
+            text_length=text_length,
+            device=device,
+        )
+        if segments is not None and active is None:
+            active = segments.ge(0)
         text_positions = self._text_positions(
             active,
+            segments,
             position_ids,
             batch_size=batch_size,
             text_length=text_length,
@@ -104,16 +115,8 @@ class PositionAttention(nn.Module):
         cos = self.cos[full_positions].to(device=device, dtype=dtype).unsqueeze(1)
         sin = self.sin[full_positions].to(device=device, dtype=dtype).unsqueeze(1)
 
-        padding_mask = None
-        if active is not None and not bool(active.all()):
-            prefix_mask = torch.ones(
-                batch_size,
-                self.prefix_length,
-                device=device,
-                dtype=torch.bool,
-            )
-            padding_mask = torch.cat((prefix_mask, active), dim=1)[:, None, None, :]
-        return PreparedAttention(padding_mask, cos, sin)
+        prepared_mask = self._attention_mask(active, segments)
+        return PreparedAttention(prepared_mask, cos, sin)
 
     @staticmethod
     def _active_mask(
@@ -135,6 +138,7 @@ class PositionAttention(nn.Module):
     @staticmethod
     def _text_positions(
         active: torch.Tensor | None,
+        segments: torch.Tensor | None,
         position_ids: torch.Tensor | None,
         *,
         batch_size: int,
@@ -151,7 +155,79 @@ class PositionAttention(nn.Module):
             if torch.any(positions < 0):
                 raise ValueError("position_ids must be non-negative.")
             return positions
+        if segments is not None:
+            indices = torch.arange(text_length, device=device).expand(batch_size, -1)
+            starts = torch.zeros_like(indices)
+            starts[:, 1:] = torch.where(
+                segments[:, 1:].ne(segments[:, :-1]),
+                indices[:, 1:],
+                0,
+            )
+            latest_start = starts.cummax(dim=-1).values
+            positions = indices - latest_start
+            return positions.masked_fill(~active, 0)
         if active is None:
             return torch.arange(text_length, device=device).expand(batch_size, -1)
         compact = active.long().cumsum(dim=-1) - 1
         return compact.masked_fill(~active, 0)
+
+    @staticmethod
+    def _segments(
+        segment_ids: torch.Tensor | None,
+        active: torch.Tensor | None,
+        *,
+        batch_size: int,
+        text_length: int,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        if segment_ids is None:
+            return None
+        if segment_ids.shape != (batch_size, text_length):
+            raise ValueError(
+                "segment_ids must have shape "
+                f"{(batch_size, text_length)}, got {tuple(segment_ids.shape)}"
+            )
+        segments = segment_ids.to(device=device, dtype=torch.long)
+        if active is None:
+            active = segments.ge(0)
+        if torch.any(segments[active] < 0):
+            raise ValueError("Active tokens must have non-negative segment_ids.")
+        return segments.masked_fill(~active, -1)
+
+    def _attention_mask(
+        self,
+        active: torch.Tensor | None,
+        segments: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        if segments is None:
+            if active is None or bool(active.all()):
+                return None
+            prefix_mask = torch.ones(
+                active.size(0),
+                self.prefix_length,
+                device=active.device,
+                dtype=torch.bool,
+            )
+            return torch.cat((prefix_mask, active), dim=1)[:, None, None, :]
+
+        if active is None:
+            active = torch.ones_like(segments, dtype=torch.bool)
+        batch_size, text_length = segments.shape
+        total_length = self.prefix_length + text_length
+        allowed = torch.zeros(
+            batch_size,
+            total_length,
+            total_length,
+            device=segments.device,
+            dtype=torch.bool,
+        )
+        allowed[:, : self.prefix_length, : self.prefix_length] = True
+        allowed[:, self.prefix_length :, : self.prefix_length] = active.unsqueeze(-1)
+        same_segment = segments.unsqueeze(-1).eq(segments.unsqueeze(-2))
+        text_attention = (
+            same_segment
+            & active.unsqueeze(-1)
+            & active.unsqueeze(-2)
+        )
+        allowed[:, self.prefix_length :, self.prefix_length :] = text_attention
+        return allowed.unsqueeze(1)

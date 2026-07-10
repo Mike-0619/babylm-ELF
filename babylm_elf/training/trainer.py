@@ -583,6 +583,9 @@ def _epoch_iterator(
     seed: int,
     epoch: int,
 ):
+    dataset = getattr(train_loader, "dataset", None)
+    if hasattr(dataset, "set_epoch"):
+        dataset.set_epoch(epoch)
     sampler = getattr(train_loader, "sampler", None)
     if hasattr(sampler, "set_epoch"):
         sampler.set_epoch(epoch)

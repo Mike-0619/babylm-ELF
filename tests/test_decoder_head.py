@@ -151,6 +151,79 @@ class DecoderHeadTest(unittest.TestCase):
             )
         torch.testing.assert_close(implicit[:, 2:], explicit[:, 2:])
 
+    def test_segment_boundaries_block_cross_record_attention(self) -> None:
+        model = BabyLMELF(_small_config("bert_mlm"))
+        model.eval()
+        first = torch.tensor([[1, 7, 8, 1, 9, 10]])
+        changed_partner = torch.tensor([[1, 7, 8, 1, 11, 12]])
+        attention_mask = torch.ones_like(first)
+        segment_ids = torch.tensor([[0, 0, 0, 1, 1, 1]])
+
+        with torch.no_grad():
+            first_hidden = model.forward_hidden(
+                model.embed_tokens(first),
+                torch.ones(1),
+                attention_mask=attention_mask,
+                segment_ids=segment_ids,
+                decoder_step_active=True,
+            )
+            changed_hidden = model.forward_hidden(
+                model.embed_tokens(changed_partner),
+                torch.ones(1),
+                attention_mask=attention_mask,
+                segment_ids=segment_ids,
+                decoder_step_active=True,
+            )
+
+        torch.testing.assert_close(first_hidden[:, :3], changed_hidden[:, :3])
+        self.assertFalse(torch.allclose(first_hidden[:, 3:], changed_hidden[:, 3:]))
+
+    def test_segment_positions_reset_at_each_record(self) -> None:
+        model = BabyLMELF(_small_config())
+        model.eval()
+        ids = torch.tensor([[1, 7, 8, 1, 9, 10]])
+        attention_mask = torch.ones_like(ids)
+        segment_ids = torch.tensor([[0, 0, 0, 1, 1, 1]])
+        position_ids = torch.tensor([[0, 1, 2, 0, 1, 2]])
+        embeddings = model.embed_tokens(ids)
+
+        with torch.no_grad():
+            implicit = model.forward_hidden(
+                embeddings,
+                torch.ones(1),
+                attention_mask=attention_mask,
+                segment_ids=segment_ids,
+                decoder_step_active=True,
+            )
+            explicit = model.forward_hidden(
+                embeddings,
+                torch.ones(1),
+                attention_mask=attention_mask,
+                segment_ids=segment_ids,
+                position_ids=position_ids,
+                decoder_step_active=True,
+            )
+
+        torch.testing.assert_close(implicit, explicit)
+
+    def test_segmented_padding_produces_finite_hidden_states(self) -> None:
+        model = BabyLMELF(_small_config())
+        model.eval()
+        ids = torch.tensor([[1, 7, 3, 3]])
+        attention_mask = torch.tensor([[1, 1, 0, 0]])
+        segment_ids = torch.tensor([[0, 0, -1, -1]])
+
+        with torch.no_grad():
+            hidden = model.forward_hidden(
+                model.embed_tokens(ids),
+                torch.ones(1),
+                attention_mask=attention_mask,
+                segment_ids=segment_ids,
+                decoder_step_active=True,
+            )
+
+        self.assertTrue(torch.isfinite(hidden).all())
+
     def test_model_uses_explicit_mode_tokens_and_learned_mask_latent(self) -> None:
         model = BabyLMELF(_small_config())
         state = model.state_dict()

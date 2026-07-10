@@ -76,13 +76,18 @@ Tokenization has one canonical storage format, `flat_int16_le_v1`:
 <s> row1_ids <s> row2_ids <s> row3_ids ...
 ```
 
-It is a raw little-endian signed-int16 stream. BOS preserves each official row
-boundary, while fixed-length packing and attention continue across row
-boundaries. Training memory-maps this file and copies only the current batch to
-`torch.long`; it does not deserialize a Python list of document tensors. The
-schema-v2 manifest records logical counts, tokenizer diagnostics, storage
-metadata, packing/step counts, byte sizes, and preparation-time SHA-256 hashes.
-Training startup checks sizes and immutable metadata without rescanning raw text.
+It is a raw little-endian signed-int16 stream. The official Hugging Face schema
+contains only `text`, so an official row is the strongest recoverable record
+boundary. Training derives segment IDs from the inserted BOS tokens, resets
+RoPE positions per record, and uses block-diagonal attention so unrelated rows
+packed into the same tensor cannot communicate. Chunk starts move by a
+deterministic epoch offset, avoiding the same cut on every pass while preserving
+the number of examples and optimizer steps. Training memory-maps the stream and
+copies only the current batch to `torch.long`; it does not deserialize a Python
+list of document tensors. The schema-v3 manifest records logical counts,
+tokenizer diagnostics, structural packing policy, byte sizes, and
+preparation-time SHA-256 hashes. Training startup checks sizes and immutable
+metadata without rescanning raw text.
 
 Distributed training never pads ranks with repeated chunks. When the full-chunk
 count is not divisible by world size, `DistributedSampler(drop_last=True)`

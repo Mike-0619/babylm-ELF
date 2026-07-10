@@ -56,7 +56,7 @@ def sdpa_attention(
     if backend == "flash" and attn_mask is not None:
         _warn_flash_mask_fallback()
         return _sdpa_attention_with_backend(
-            "math",
+            "auto",
             query,
             key,
             value,
@@ -104,8 +104,8 @@ def _warn_flash_mask_fallback() -> None:
     if _warned_flash_mask_fallback:
         return
     warnings.warn(
-        f"{SDPA_BACKEND_ENV}=flash does not support padding masks; "
-        "using math SDPA for masked batches.",
+        f"{SDPA_BACKEND_ENV}=flash does not support explicit attention masks; "
+        "using the fastest compatible SDPA backend for masked batches.",
         RuntimeWarning,
         stacklevel=2,
     )
