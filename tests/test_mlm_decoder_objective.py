@@ -11,6 +11,7 @@ from babylm_elf.modeling.mask_latent import build_embedding_stats_mask_latent
 from babylm_elf.training.step import (
     apply_mlm_mask_latent,
     build_mlm_decoder_inputs,
+    make_target_mask,
     make_one_per_segment_step10_then_step20_mlm_input,
     train_step,
 )
@@ -46,6 +47,7 @@ class EchoInputTokenModel(torch.nn.Module):
         )
         self.embedded_input_ids: list[torch.Tensor] = []
         self.seen_cfg_scales: list[torch.Tensor] = []
+        self.forward_batch_sizes: list[int] = []
         self.forward_calls = 0
 
     def embed_tokens(
@@ -68,6 +70,7 @@ class EchoInputTokenModel(torch.nn.Module):
         del t, attention_mask, decoder_step_active
         if self_cond_cfg_scale is not None:
             self.seen_cfg_scales.append(self_cond_cfg_scale.detach().cpu())
+        self.forward_batch_sizes.append(x.size(0))
         self.forward_calls += 1
         current_ids = x[..., : self.embedding_size].argmax(dim=-1)
         logits = x.new_full((*current_ids.shape, self.vocab_size), -5.0)
@@ -85,6 +88,23 @@ class EchoInputTokenModel(torch.nn.Module):
 
 
 class MLMDecoderObjectiveTest(unittest.TestCase):
+    def test_target_mask_excludes_padding_and_reserved_special_tokens(self) -> None:
+        input_ids = torch.tensor([[1, 16, 2, 17, 3]])
+        attention_mask = torch.tensor([[1, 1, 1, 1, 0]])
+
+        target_mask = make_target_mask(
+            input_ids,
+            attention_mask,
+            special_token_count=16,
+        )
+
+        self.assertTrue(
+            torch.equal(
+                target_mask,
+                torch.tensor([[False, True, False, True, False]]),
+            )
+        )
+
     def test_step10_then_step20_masks_one_token_per_short_segment(self) -> None:
         torch.manual_seed(0)
         input_ids = torch.tensor([[1, 16, 17, 1, 18, 19, 1, 20, 21, 1, 22, 23, 2]])
@@ -611,6 +631,34 @@ class MLMDecoderObjectiveTest(unittest.TestCase):
         self.assertTrue(torch.equal(embedded_input_ids, batch["input_ids"]))
         self.assertEqual(embedded_input_ids.eq(4).sum().item(), 0)
 
+    def test_decoder_ineligible_rows_fall_back_to_flow_instead_of_disappearing(
+        self,
+    ) -> None:
+        torch.manual_seed(0)
+        model = EchoInputTokenModel()
+        batch = {
+            "input_ids": torch.tensor([[1, 16, 17, 2], [1, 2, 3, 3]]),
+            "attention_mask": torch.tensor([[1, 1, 1, 1], [1, 1, 0, 0]]),
+        }
+        config = DiffusionConfig(
+            decoder_objective="token_mlm",
+            decoder_probability=1.0,
+            mlm_special_token_count=16,
+            self_condition_probability=0.0,
+        )
+
+        output = train_step(model, batch, config)
+
+        self.assertTrue(torch.isfinite(output.loss))
+        self.assertEqual(output.metrics["decode_frac"], 0.5)
+        self.assertGreater(output.metrics["ce"], 0.0)
+        self.assertEqual(output.metrics["flow"], 0.0)
+        self.assertEqual(model.forward_batch_sizes[-1], 2)
+        self.assertEqual(len(model.embedded_input_ids), 2)
+        self.assertTrue(
+            torch.equal(model.embedded_input_ids[1], batch["input_ids"][:1])
+        )
+
     def test_unsupported_decoder_objective_is_rejected(self) -> None:
         model = EchoInputTokenModel()
         batch = {
@@ -706,7 +754,34 @@ class MLMDecoderObjectiveTest(unittest.TestCase):
         self.assertGreater(output.metrics["ce"], 0.0)
         self.assertGreater(output.metrics["decode_frac"], 0.0)
         self.assertLess(output.metrics["decode_frac"], 0.5)
-        self.assertGreater(model.forward_calls, 1)
+        self.assertEqual(model.forward_calls, 1)
+
+    def test_self_conditioning_auxiliary_forwards_only_use_active_flow_rows(
+        self,
+    ) -> None:
+        torch.manual_seed(0)
+        model = EchoInputTokenModel(vocab_size=256)
+        input_ids = torch.tensor(
+            [[1, *range(16 + row * 4, 20 + row * 4), 2] for row in range(32)]
+        )
+        batch = {
+            "input_ids": input_ids,
+            "attention_mask": torch.ones_like(input_ids),
+        }
+        config = DiffusionConfig(
+            decoder_objective="token_mlm",
+            decoder_probability=0.5,
+            mlm_special_token_count=16,
+            self_condition_probability=1.0,
+        )
+
+        output = train_step(model, batch, config)
+
+        decoder_count = round(output.metrics["decode_frac"] * input_ids.size(0))
+        flow_count = input_ids.size(0) - decoder_count
+        self.assertGreater(decoder_count, 0)
+        self.assertGreater(flow_count, 0)
+        self.assertEqual(model.forward_batch_sizes, [flow_count, flow_count, 32])
 
 if __name__ == "__main__":
     unittest.main()

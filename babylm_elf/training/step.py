@@ -19,6 +19,25 @@ def unwrap_model(model):
     return getattr(model, "module", model)
 
 
+def make_target_mask(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    *,
+    special_token_count: int,
+    excluded_token_ids: tuple[int, ...] | list[int] = (),
+) -> torch.Tensor:
+    """Return positions that may contribute a lexical-token training target."""
+    target_mask = attention_mask.bool() & input_ids.ge(special_token_count)
+    if excluded_token_ids:
+        excluded = torch.as_tensor(
+            tuple(excluded_token_ids),
+            device=input_ids.device,
+            dtype=input_ids.dtype,
+        )
+        target_mask = target_mask & ~torch.isin(input_ids, excluded)
+    return target_mask
+
+
 def train_step(
     model,
     batch: dict[str, torch.Tensor],
@@ -60,8 +79,15 @@ def train_step_token_mlm(
     batch_size = input_ids.size(0)
     device = input_ids.device
     base_model = unwrap_model(model)
+    decoder_target_mask = make_target_mask(
+        input_ids,
+        attention_mask,
+        special_token_count=config.mlm_special_token_count,
+        excluded_token_ids=getattr(config, "mlm_excluded_token_ids", ()),
+    )
+    decoder_eligible_rows = decoder_target_mask.any(dim=-1)
 
-    if config.decoder_probability >= 1.0:
+    if config.decoder_probability >= 1.0 and bool(decoder_eligible_rows.all()):
         return run_decoder_only_step(
             model,
             input_ids,
@@ -88,7 +114,8 @@ def train_step_token_mlm(
     ).clamp_min(config.t_eps)
 
     decoder_active = (
-        torch.rand(batch_size, device=device) < config.decoder_probability
+        (torch.rand(batch_size, device=device) < config.decoder_probability)
+        & decoder_eligible_rows
     ).to(dtype)
     decoder_rows = decoder_active.bool().nonzero(as_tuple=False).flatten()
     denoiser_rows = (~decoder_active.bool()).nonzero(as_tuple=False).flatten()
@@ -110,43 +137,64 @@ def train_step_token_mlm(
         cfg_scale,
     )
 
-    if denoiser_rows.numel() > 0:
-        zero_condition = torch.zeros_like(clean)
+    self_condition = torch.zeros_like(clean)
+    self_condition_rows = (
+        self_condition_mask.view(batch_size).bool() & ~decoder_active.bool()
+    ).nonzero(as_tuple=False).flatten()
+    if self_condition_rows.numel() > 0:
+        self_condition_z = denoiser_z.index_select(0, self_condition_rows)
+        self_condition_t = t.index_select(0, self_condition_rows)
+        self_condition_attention = attention_mask.index_select(
+            0,
+            self_condition_rows,
+        )
+        self_condition_cfg = cfg_scale.index_select(0, self_condition_rows)
+        auxiliary_decoder_active = torch.zeros(
+            self_condition_rows.numel(),
+            device=device,
+            dtype=dtype,
+        )
         with torch.no_grad():
             unconditioned_prediction, _ = base_model(
-                torch.cat((denoiser_z, zero_condition), dim=-1),
-                t,
-                attention_mask=attention_mask,
-                self_cond_cfg_scale=cfg_scale,
-                decoder_step_active=torch.zeros_like(decoder_active),
+                torch.cat(
+                    (self_condition_z, torch.zeros_like(self_condition_z)),
+                    dim=-1,
+                ),
+                self_condition_t,
+                attention_mask=self_condition_attention,
+                self_cond_cfg_scale=self_condition_cfg,
+                decoder_step_active=auxiliary_decoder_active,
             )
             unconditioned_velocity = prediction_to_velocity(
                 unconditioned_prediction,
-                denoiser_z,
-                t,
+                self_condition_z,
+                self_condition_t,
                 config.t_eps,
             )
             conditioned_prediction, _ = base_model(
-                torch.cat((denoiser_z, unconditioned_prediction), dim=-1),
-                t,
-                attention_mask=attention_mask,
-                self_cond_cfg_scale=cfg_scale,
-                decoder_step_active=torch.zeros_like(decoder_active),
+                torch.cat((self_condition_z, unconditioned_prediction), dim=-1),
+                self_condition_t,
+                attention_mask=self_condition_attention,
+                self_cond_cfg_scale=self_condition_cfg,
+                decoder_step_active=auxiliary_decoder_active,
             )
             conditioned_velocity = prediction_to_velocity(
                 conditioned_prediction,
-                denoiser_z,
-                t,
+                self_condition_z,
+                self_condition_t,
                 config.t_eps,
             )
-            guidance = (1.0 - 1.0 / cfg_scale.view(-1, 1, 1)) * (
+            guidance = (1.0 - 1.0 / self_condition_cfg.view(-1, 1, 1)) * (
                 conditioned_velocity - unconditioned_velocity
             )
-            velocity_target = velocity_target + guidance * self_condition_mask
-    else:
-        unconditioned_prediction = torch.zeros_like(clean)
-
-    self_condition = unconditioned_prediction * self_condition_mask
+        self_condition.index_copy_(
+            0,
+            self_condition_rows,
+            unconditioned_prediction,
+        )
+        guidance_target = torch.zeros_like(velocity_target)
+        guidance_target.index_copy_(0, self_condition_rows, guidance)
+        velocity_target = velocity_target + guidance_target
 
     z_parts: list[torch.Tensor] = []
     self_condition_parts: list[torch.Tensor] = []
@@ -256,7 +304,12 @@ def train_step_token_mlm(
             predicted_velocity
             - velocity_target.index_select(0, denoiser_rows).detach()
         ).square().mean(dim=-1)
-        l2_mask = valid_mask.index_select(0, denoiser_rows)
+        flow_target_mask = make_target_mask(
+            input_ids,
+            attention_mask,
+            special_token_count=config.mlm_special_token_count,
+        ).to(torch.float32)
+        l2_mask = flow_target_mask.index_select(0, denoiser_rows)
         flow = (l2_per_token * l2_mask).sum() / l2_mask.sum().clamp_min(1.0)
     else:
         flow = zero_from_forward
@@ -450,14 +503,12 @@ def _make_one_per_segment_mlm_input(
         sequence_ids = torch.arange(input_ids.size(0), device=device, dtype=torch.long)
     else:
         sequence_ids = sequence_ids.to(device=device, dtype=torch.long)
-    maskable = attention_mask.bool() & input_ids.ge(special_token_count)
-    if excluded_token_ids:
-        excluded = torch.as_tensor(
-            tuple(excluded_token_ids),
-            device=device,
-            dtype=input_ids.dtype,
-        )
-        maskable = maskable & ~torch.isin(input_ids, excluded)
+    maskable = make_target_mask(
+        input_ids,
+        attention_mask,
+        special_token_count=special_token_count,
+        excluded_token_ids=excluded_token_ids,
+    )
 
     selected_input_ids: list[torch.Tensor] = []
     selected_masks: list[torch.Tensor] = []
