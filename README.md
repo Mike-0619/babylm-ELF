@@ -24,8 +24,10 @@ Build and validate the canonical schema-v3 manifests, tokenizers, and
 `flat_int16_le_v1` streams:
 
 ```bash
-sbatch scripts/prepare/prepare_2026_10M.slurm
-sbatch scripts/prepare/prepare_2026_100M.slurm
+python -m babylm_elf prepare \
+  --config configs/10m/elf_noisy.yml --world-size 4 --staging
+python -m babylm_elf prepare \
+  --config configs/100m/elf_noisy.yml --world-size 4 --staging
 ```
 
 Data preparation and training share the same audited experiment configs:
@@ -42,7 +44,10 @@ dataset fingerprint, corpus statistics, and artifact hashes.
 An optional four-rank data smoke is available:
 
 ```bash
-sbatch scripts/prepare/smoke_2026_data_4rank.slurm
+torchrun --standalone --nproc_per_node=4 \
+  -m babylm_elf smoke-data \
+  --config configs/10m/elf_noisy.yml \
+  --config configs/100m/elf_noisy.yml
 ```
 
 The package has one command surface:
@@ -68,20 +73,24 @@ babylm_elf/
 
 The five maintained 10M experiments are:
 
-| Route | Config | Slurm |
-| --- | --- | --- |
-| ELF noisy-CE | `configs/10m/elf_noisy.yml` | `scripts/train/10m_elf_noisy.slurm` |
-| ELF noisy-CE (empirical Muon LR) | `configs/10m/elf_noisy_muon.yml` | `scripts/train/10m_elf_noisy_muon.slurm` |
-| ELF cyclic token-MLM | `configs/10m/elf_mlm_cyclic.yml` | `scripts/train/10m_elf_mlm_cyclic.slurm` |
-| ELF BERT15 token-MLM | `configs/10m/elf_mlm_bert15.yml` | `scripts/train/10m_elf_mlm_bert15.slurm` |
-| Standard MDLM | `configs/10m/elf_mdlm.yml` | `scripts/train/10m_elf_mdlm.slurm` |
+| Route | Config |
+| --- | --- |
+| ELF noisy-CE | `configs/10m/elf_noisy.yml` |
+| ELF noisy-CE (empirical Muon LR) | `configs/10m/elf_noisy_muon.yml` |
+| ELF cyclic token-MLM | `configs/10m/elf_mlm_cyclic.yml` |
+| ELF BERT15 token-MLM | `configs/10m/elf_mlm_bert15.yml` |
+| Standard MDLM | `configs/10m/elf_mdlm.yml` |
 
 The two 100M ELF-B experiments are:
 
-| Route | Config | Slurm |
-| --- | --- | --- |
-| ELF noisy-CE | `configs/100m/elf_noisy.yml` | `scripts/train/100m_elf_noisy.slurm` |
-| Standard MDLM | `configs/100m/elf_mdlm.yml` | `scripts/train/100m_elf_mdlm.slurm` |
+| Route | Config |
+| --- | --- |
+| ELF noisy-CE | `configs/100m/elf_noisy.yml` |
+| Standard MDLM | `configs/100m/elf_mdlm.yml` |
+
+Cluster submission scripts are intentionally local and ignored under
+`scripts/`; they may contain site-specific partitions, hosts, and environment
+paths without entering Git history.
 
 For a direct launch, pass the experiment config explicitly:
 
