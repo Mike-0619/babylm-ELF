@@ -11,8 +11,7 @@ htmlcov/
 # Local run artifacts
 /.cache/
 /data/
-/logs/*
-!/logs/.gitkeep
+/logs/
 /outputs/
 
 # Local-only material
