@@ -1,14 +1,10 @@
-# Core training
-# Install PyTorch separately to match the cluster CUDA driver, e.g.:
-# pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cu121
-
-# BabyLM data and tokenizer
-datasets>=2.12
-tokenizers>=0.15
-transformers>=4.38
-safetensors>=0.4
-muon-optimizer>=0.1.0
-
-# Configs and progress bars
-PyYAML>=6.0
-tqdm>=4.65
+torch>=2.6,<2.13
+numpy>=1.26,<3
+datasets>=3.2,<6
+transformers>=4.48,<6
+tokenizers>=0.21,<0.23
+safetensors>=0.5,<1
+huggingface-hub>=0.27,<2
+muon-optimizer>=0.1.0,<0.2
+PyYAML>=6.0.2,<7
+tqdm>=4.67,<5

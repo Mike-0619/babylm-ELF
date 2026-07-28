@@ -1,133 +1,137 @@
 # BabyLM ELF
 
-BabyLM 2026 Strict/Strict-Small implementation of Embedded Language Flows
-with a from-scratch contextual encoder.
+BabyLM 2026 ELF experiments with five Strict-Small 10M routes and two Strict
+100M ELF-B routes. The official source tree at `../ELF` is a read-only
+reference; all BabyLM code and configuration live here. Four AdamW routes form
+the objective-controlled main comparison; the fifth is an optimizer-controlled
+Muon noisy-CE comparison.
 
-The main 2026 recipe is:
+The complete model, objective, optimizer, exposure, checkpoint, and adapter
+specification is in [project.md](project.md).
 
-```text
-16K BabyLM BPE ids
--> scratch T5-small-style span-corruption encoder
--> channel-wise normalized 512-d contextual latents
--> ELF-B continuous flow model
--> final-step MLM logits over the base 16K vocab
-```
-
-The tokenizer is trained only on the allowed BabyLM corpus. Exported tokenizer
-files do not contain T5 `<extra_id_*>` tokens. Encoder pretraining uses internal
-sentinel ids above the base vocab:
-
-```text
-base_vocab_size = 16384
-sentinel_start_id = 16384
-sentinel_count = 100
-encoder_vocab_size = 16484
-```
-
-Encoder exposure counts toward the BabyLM 10-epoch budget. The default split is
-3 encoder epochs plus 7 ELF epochs.
-
-## Layout
-
-```text
-babylm_elf/cli/       prepare, encoder-train, ELF-train, HF-export entry points
-babylm_elf/encoder/   T5-style span corruption utilities
-babylm_elf/modeling/  ELF-B model with frozen scratch encoder mode
-babylm_elf/training/  trainer, optimizer, checkpoint exposure accounting
-babylm_elf/export/    Hugging Face remote-code export for AutoModel/MLM
-configs/              10M/100M encoder and scratch-ELF configs
-scripts/              thin local and SLURM wrappers
-tests/                tokenizer/span/encoder/export/accounting smoke tests
-```
-
-## Setup
+## Install
 
 ```bash
 conda activate babylm-elf
 pip install -r requirements.txt
 ```
 
-PyTorch should match the cluster CUDA driver; see `requirements.txt`.
+Install a PyTorch build compatible with the cluster's CUDA driver.
 
-## 10M Run
+## Prepare Data
 
-```bash
-scripts/prepare_2026_10M.sh
-scripts/train_encoder_2026_10M.sh
-scripts/train_2026_10M.sh
-scripts/export_2026_10M_hf.sh
-```
-
-On SLURM:
+Build and validate the canonical schema-v3 manifests, tokenizers, and
+`flat_int16_le_v1` streams:
 
 ```bash
-sbatch scripts/slurm/prepare_2026_10M.slurm
-sbatch scripts/slurm/train_encoder_2026_10M.slurm
-sbatch scripts/slurm/train_2026_10M.slurm
-bash scripts/slurm/export_2026_10M_hf.txt
+sbatch scripts/prepare/prepare_2026_10M.slurm
+sbatch scripts/prepare/prepare_2026_100M.slurm
 ```
 
-## 100M Run
-
-```bash
-scripts/prepare_2026_100M.sh
-scripts/train_encoder_2026_100M.sh
-scripts/train_2026_100M.sh
-scripts/export_2026_100M_hf.sh
-```
-
-On SLURM:
-
-```bash
-sbatch scripts/slurm/prepare_2026_100M.slurm
-sbatch scripts/slurm/train_encoder_2026_100M.slurm
-sbatch scripts/slurm/train_2026_100M.slurm
-bash scripts/slurm/export_2026_100M_hf.txt
-```
-
-## Expected Artifacts
+Data preparation and training share the same audited experiment configs:
 
 ```text
-data/2026_10M/tokenizer/tokenizer.json
-data/2026_10M/tokenized/train_10M.bin
-outputs/2026_10M/encoder/checkpoints/final.pt
-outputs/2026_10M/encoder/latent_stats.pt
-outputs/2026_10M/scratch_encoder_muon/checkpoints/babylm_required/chck_*M.pt
-outputs/2026_10M/scratch_encoder_muon/hf_revisions/
-outputs/2026_10M/scratch_encoder_muon/hf_revisions/scratch_encoder_muon_hf/
-
-data/2026_100M/tokenizer/tokenizer.json
-data/2026_100M/tokenized/train_100M.bin
-outputs/2026_100M/encoder/checkpoints/final.pt
-outputs/2026_100M/encoder/latent_stats.pt
-outputs/2026_100M/scratch_encoder_muon/checkpoints/babylm_required/chck_*M.pt
-outputs/2026_100M/scratch_encoder_muon/hf_revisions/
-outputs/2026_100M/scratch_encoder_muon/hf_revisions/scratch_encoder_muon_hf/
+configs/10m/elf_noisy.yml
+configs/100m/elf_noisy.yml
 ```
 
-For 10M, checkpoint metadata reports total exposure as
-`30M encoder words + ELF words`, so required revisions start after the encoder
-offset. For 100M, the offset is `300M`.
+These canonical representatives pin each track's dataset revision and artifact
+paths. The generated schema-v3 manifest is the single source of truth for the
+dataset fingerprint, corpus statistics, and artifact hashes.
 
-## Tests
+An optional four-rank data smoke is available:
 
 ```bash
-python -m unittest discover tests
+sbatch scripts/prepare/smoke_2026_data_4rank.slurm
 ```
 
-For Hugging Face remote-code tests on systems with a read-only home cache:
+The package has one command surface:
+
+```text
+python -m babylm_elf {train,prepare,smoke-data,export,train-encoder,contextuality}
+```
+
+Run `python -m babylm_elf COMMAND --help` for command-specific arguments.
+
+## Source Layout
+
+```text
+babylm_elf/
+├── config.py       # strict YAML parsing and resolved runs
+├── modules/        # ELF model, layers, attention, and embeddings
+├── training/       # objectives, loop, optimizers, checkpoints, encoder jobs
+├── data/           # mmap datasets, manifests, tokenization, and preparation
+└── export/         # checkpoint conversion and HF remote code
+```
+
+## Train
+
+The five maintained 10M experiments are:
+
+| Route | Config | Slurm |
+| --- | --- | --- |
+| ELF noisy-CE | `configs/10m/elf_noisy.yml` | `scripts/train/10m_elf_noisy.slurm` |
+| ELF noisy-CE (empirical Muon LR) | `configs/10m/elf_noisy_muon.yml` | `scripts/train/10m_elf_noisy_muon.slurm` |
+| ELF cyclic token-MLM | `configs/10m/elf_mlm_cyclic.yml` | `scripts/train/10m_elf_mlm_cyclic.slurm` |
+| ELF BERT15 token-MLM | `configs/10m/elf_mlm_bert15.yml` | `scripts/train/10m_elf_mlm_bert15.slurm` |
+| Standard MDLM | `configs/10m/elf_mdlm.yml` | `scripts/train/10m_elf_mdlm.slurm` |
+
+The two 100M ELF-B experiments are:
+
+| Route | Config | Slurm |
+| --- | --- | --- |
+| ELF noisy-CE | `configs/100m/elf_noisy.yml` | `scripts/train/100m_elf_noisy.slurm` |
+| Standard MDLM | `configs/100m/elf_mdlm.yml` | `scripts/train/100m_elf_mdlm.slurm` |
+
+For a direct launch, pass the experiment config explicitly:
 
 ```bash
-HF_HOME=/tmp/babylm-elf-hf-test \
-TRANSFORMERS_CACHE=/tmp/babylm-elf-hf-test/transformers \
-python -m unittest tests.test_hf_export
+torchrun --standalone --nproc_per_node=4 \
+  -m babylm_elf train \
+  --config configs/10m/elf_mlm_cyclic.yml
 ```
 
-## Notes
+`--config` is required; training never selects an implicit experiment.
 
-- Raw data preparation stays shared between 10M and 100M.
-- The official BabyLM backend should be `mlm`.
-- `AutoModel` returns `BaseModelOutput(last_hidden_state=...)`.
-- `AutoModelForMaskedLM` returns `MaskedLMOutput(logits=...)`.
-- The scratch encoder is frozen during ELF training and excluded from the
-  optimizer and EMA trainable shadow.
+## Resume
+
+Resume automatically from format-v4 `latest.pt`:
+
+```bash
+torchrun --standalone --nproc_per_node=4 \
+  -m babylm_elf train \
+  --config configs/10m/elf_mlm_cyclic.yml \
+  --resume auto
+```
+
+Revision checkpoints are lightweight evaluation artifacts and are not accepted
+for training resume. `auto` starts only when the run directory is empty; it
+refuses to overwrite revision artifacts when `latest.pt` is missing. An
+explicit checkpoint path remains supported.
+
+## Export
+
+Export EMA weights for the main checkpoint:
+
+```bash
+python -m babylm_elf export \
+  --config configs/10m/elf_mlm_cyclic.yml
+```
+
+Export the main checkpoint plus every required exposure revision:
+
+```bash
+python -m babylm_elf export \
+  --config configs/10m/elf_mlm_cyclic.yml \
+  --all-revisions --track strict-small
+```
+
+Use `--track strict` with a 100M config to export all 28 revisions through
+`chck_1000M`.
+
+Use `--weights raw` to export raw weights. Remote code supports `AutoModel` and
+`AutoModelForMaskedLM`; Standard MDLM also exposes `generate_mdlm()`.
+
+Scratch T5, Gaussian embeddings, encoder pretraining/contextuality, and their
+format-v4 HF export remain supported interfaces. They are not additional
+entries in the seven-experiment matrix.
