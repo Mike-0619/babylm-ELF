@@ -1,0 +1,64 @@
+name: 10m_elf_mdlm
+seed: 42
+output_dir: outputs/official_elf/2026_10M
+
+training:
+  epochs: 10
+  batch_size: 32
+  gradient_accumulation_steps: 1
+  precision: bf16
+  log_every: 50
+  latest_every_steps: 500
+  checkpoint_by_words: true
+  checkpoint_word_limit: 100_000_000
+
+model:
+  embedding_size: 384
+  hidden_size: 512
+  intermediate_size: 2_048
+  num_hidden_layers: 8
+  num_attention_heads: 8
+  max_position_embeddings: 128
+  bottleneck_size: 96
+  embedding_source: learnable
+
+data:
+  source: huggingface
+  hf_dataset: BabyLM-community/BabyLM-2026-Strict-Small
+  hf_revision: c92ab16b4f08858304b0815706065b3354d8fc0a
+  train_text: data/2026_10M/raw/train_10M.txt
+  train_path: data/2026_10M/tokenized/train_10M.bin
+  tokenizer_path: data/2026_10M/tokenizer/tokenizer.json
+  manifest_path: data/2026_10M/manifest.json
+  seq_length: 128
+  train_word_count: 10_000_000
+
+optimizer:
+  type: adamw
+  learning_rate: 4.0e-4
+  weight_decay: 0.0
+  beta1: 0.9
+  beta2: 0.999
+  eps: 1.0e-8
+  max_grad_norm: 1.0
+
+scheduler:
+  type: cosine
+  warmup_epochs: 0.5
+  min_lr: 4.0e-5
+
+ema:
+  reference_decay: 0.9999
+  reference_steps: 95_000
+  warmup: true
+  scale_to_run: true
+
+objective:
+  type: standard_mdlm
+  targets: {filter_empty_control: true}
+  noise_schedule: loglinear
+  sampling_eps: 0.001
+  noise_eps: 0.001
+  antithetic_sampling: true
+  time_conditioning: t
+  sampling_steps: 128

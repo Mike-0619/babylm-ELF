@@ -1,33 +1,21 @@
-# Python cache
+# Python artifacts
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage*
+htmlcov/
+/.venv/
 
-# Local BabyLM data
-/data/
-
-# Training logs and outputs
-/logs/
-/outputs/
+# Local run artifacts
 /.cache/
-*.pt
-*.pth
-*.ckpt
-*.safetensors
+/data/
+/logs/*
+!/logs/.gitkeep
+/outputs/
 
-
-references
-
-project.md
-
-# Paper build artifacts
-paper/*.aux
-paper/*.bbl
-paper/*.bcf
-paper/*.blg
-paper/*.fdb_latexmk
-paper/*.fls
-paper/*.log
-paper/*.out
-paper/*.pdf
-paper/*.run.xml
-paper/*.synctex.gz
+# Local-only material
+/docs/
+/paper/
+/tests/

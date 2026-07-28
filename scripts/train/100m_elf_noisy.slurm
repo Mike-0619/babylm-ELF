@@ -1,22 +1,31 @@
 #!/bin/bash
 
-#SBATCH --job-name=prepare_2026_100M
+# ELF-B official noisy-CE on BabyLM Strict 100M.
+
+#SBATCH --job-name=elf100-noisy
 #SBATCH --output=logs/%j.out
 #SBATCH --error=logs/%j.err
+
 #SBATCH --partition=compute
 #SBATCH --nodes=1
 #SBATCH --exclude=gpu-nvidia-h100
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=32G
-#SBATCH --time=02:30:00
+#SBATCH --gres=gpu:nvidia:4
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=16G
+#SBATCH --time=06:00:00
 
 set -euo pipefail
+
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
 source "${CONDA_ROOT:-$HOME/miniforge3}/etc/profile.d/conda.sh"
 conda activate babylm-elf
+
+export BABYLM_ELF_SDPA_BACKEND=flash
+
 mkdir -p logs
 
-python -m babylm_elf prepare \
+srun torchrun --standalone --nproc_per_node=4 \
+  -m babylm_elf train \
   --config configs/100m/elf_noisy.yml \
-  --world-size 4 \
-  --staging
+  --resume auto

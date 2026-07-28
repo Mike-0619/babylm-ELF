@@ -16,7 +16,7 @@ source "${CONDA_ROOT:-$HOME/miniforge3}/etc/profile.d/conda.sh"
 conda activate babylm-elf
 mkdir -p logs
 
-python -m babylm_elf.cli.prepare_data \
-  --config configs/data/2026_10M.yml \
-  --world_size 4 \
+python -m babylm_elf prepare \
+  --config configs/10m/elf_noisy.yml \
+  --world-size 4 \
   --staging
