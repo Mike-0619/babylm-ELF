@@ -50,6 +50,14 @@ torchrun --standalone --nproc_per_node=4 \
   --config configs/100m/elf_noisy.yml
 ```
 
+Cluster-agnostic Slurm templates are available at:
+
+```text
+scripts/prepare/prepare_2026_10M.slurm
+scripts/prepare/prepare_2026_100M.slurm
+scripts/prepare/smoke_2026_data_4rank.slurm
+```
+
 The package has one command surface:
 
 ```text
@@ -73,24 +81,25 @@ babylm_elf/
 
 The five maintained 10M experiments are:
 
-| Route | Config |
-| --- | --- |
-| ELF noisy-CE | `configs/10m/elf_noisy.yml` |
-| ELF noisy-CE (empirical Muon LR) | `configs/10m/elf_noisy_muon.yml` |
-| ELF cyclic token-MLM | `configs/10m/elf_mlm_cyclic.yml` |
-| ELF BERT15 token-MLM | `configs/10m/elf_mlm_bert15.yml` |
-| Standard MDLM | `configs/10m/elf_mdlm.yml` |
+| Route | Config | Slurm |
+| --- | --- | --- |
+| ELF noisy-CE | `configs/10m/elf_noisy.yml` | `scripts/train/10m_elf_noisy.slurm` |
+| ELF noisy-CE (empirical Muon LR) | `configs/10m/elf_noisy_muon.yml` | `scripts/train/10m_elf_noisy_muon.slurm` |
+| ELF cyclic token-MLM | `configs/10m/elf_mlm_cyclic.yml` | `scripts/train/10m_elf_mlm_cyclic.slurm` |
+| ELF BERT15 token-MLM | `configs/10m/elf_mlm_bert15.yml` | `scripts/train/10m_elf_mlm_bert15.slurm` |
+| Standard MDLM | `configs/10m/elf_mdlm.yml` | `scripts/train/10m_elf_mdlm.slurm` |
 
 The two 100M ELF-B experiments are:
 
-| Route | Config |
-| --- | --- |
-| ELF noisy-CE | `configs/100m/elf_noisy.yml` |
-| Standard MDLM | `configs/100m/elf_mdlm.yml` |
+| Route | Config | Slurm |
+| --- | --- | --- |
+| ELF noisy-CE | `configs/100m/elf_noisy.yml` | `scripts/train/100m_elf_noisy.slurm` |
+| Standard MDLM | `configs/100m/elf_mdlm.yml` | `scripts/train/100m_elf_mdlm.slurm` |
 
-Cluster submission scripts are intentionally local and ignored under
-`scripts/`; they may contain site-specific partitions, hosts, and environment
-paths without entering Git history.
+The tracked templates contain only portable resource requests. Activate a
+working Python environment and submit them from the repository root. Keep
+site-specific partitions, GPU selectors, hosts, and environment paths in
+ignored wrappers under `scripts/local/`.
 
 For a direct launch, pass the experiment config explicitly:
 

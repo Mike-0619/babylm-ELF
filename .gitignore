@@ -13,7 +13,7 @@ htmlcov/
 /data/
 /logs/
 /outputs/
-/scripts/
+/scripts/local/
 /slurm-*.out
 /slurm-*.err
 

@@ -202,10 +202,11 @@ every rank.
 Both use checkpoint format v4; older checkpoint formats are intentionally not
 loaded by the refactored training or export code.
 
-Training accepts `--resume auto|PATH`; local cluster wrappers should use
-`auto`. Automatic resume loads `latest.pt`, starts only in an empty run
-directory, and refuses to overwrite orphaned revisions. Resume validates
-model, data, optimizer, objective, and world size, reconstructs and skips the
+Training accepts `--resume auto|PATH`; the tracked training templates use
+`auto`, while ignored local wrappers supply cluster-specific submission
+options. Automatic resume loads `latest.pt`, starts only in an empty run
+directory, and refuses to overwrite orphaned revisions. Resume validates model,
+data, optimizer, objective, and world size, reconstructs and skips the
 dataloader, then restores the saved per-rank random streams.
 
 HF remote code supports `AutoModel`, `AutoModelForMaskedLM`, EMA/raw selection,
