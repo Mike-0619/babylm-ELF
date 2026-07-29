@@ -1,23 +1,19 @@
-# Python artifacts
+# Python
 __pycache__/
 *.py[cod]
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage*
-htmlcov/
 /.venv/
 
-# Local run artifacts
+# Generated data and runs
 /.cache/
 /data/
 /logs/
 /outputs/
-/scripts/local/
 /slurm-*.out
 /slurm-*.err
 
-# Local-only material
+# Local-only workflow
+/AGENTS.md
+/scripts/local/
 /docs/
 /paper/
 /tests/
