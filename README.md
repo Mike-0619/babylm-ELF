@@ -55,7 +55,6 @@ Cluster-agnostic Slurm templates are available at:
 ```text
 scripts/prepare/prepare_2026_10M.slurm
 scripts/prepare/prepare_2026_100M.slurm
-scripts/prepare/smoke_2026_data_4rank.slurm
 ```
 
 The package has one command surface:
