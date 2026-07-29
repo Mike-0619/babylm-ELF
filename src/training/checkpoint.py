@@ -10,6 +10,8 @@ import uuid
 import torch
 import torch.distributed as dist
 
+from src.config import TRAINING_SEMANTICS_VERSION
+
 Track = Literal["strict-small", "strict"]
 
 STRICT_SMALL_MILLIONS = (*range(1, 10), *range(10, 101, 10))
@@ -519,6 +521,15 @@ def _validate_v4(checkpoint: dict, *, kind: str | None = None) -> None:
         )
     if set(checkpoint["weights"]) != {"raw", "ema"}:
         raise ValueError("Checkpoint weights must contain exactly raw and ema.")
+    semantics_version = checkpoint["resolved_config"].get(
+        "training_semantics_version"
+    )
+    if semantics_version != TRAINING_SEMANTICS_VERSION:
+        raise ValueError(
+            "Checkpoint training semantics are incompatible: "
+            f"expected version {TRAINING_SEMANTICS_VERSION}, "
+            f"got {semantics_version!r}."
+        )
 
 
 def atomic_torch_save(checkpoint: dict, path: Path) -> None:
@@ -546,6 +557,7 @@ def _unwrap_model(model):
 def _training_stability_metadata(state, resolved) -> dict:
     ema = resolved.config.ema
     metadata = {
+        "training_semantics_version": TRAINING_SEMANTICS_VERSION,
         "model_init_seed": int(resolved.config.seed),
         "runtime_seed_policy": "base_seed_plus_global_rank",
         "runtime_seed_rank0": int(resolved.config.seed),

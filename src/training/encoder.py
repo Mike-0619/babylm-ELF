@@ -14,22 +14,22 @@ from transformers import (
     T5ForConditionalGeneration,
 )
 
-from babylm_elf.config import (
+from src.config import (
     EncoderTrainConfig,
     load_config,
     resolve_model_config,
 )
-from babylm_elf.data.dataset import (
+from src.data.dataset import (
     build_dataloader,
     load_data_manifest,
     validate_training_data_manifest,
 )
-from babylm_elf.data.prepare import load_tokenizer
-from babylm_elf.modules.encoder import scratch_encoder_attention_mask
-from babylm_elf.modules.model import BabyLMELF
-from babylm_elf.training.checkpoint import atomic_torch_save, select_model_weights
-from babylm_elf.training.optim import create_scheduler, resolve_device, seed_everything
-from babylm_elf.training.train import autocast_context, format_metrics, move_batch
+from src.data.prepare import load_tokenizer
+from src.modules.encoder import scratch_encoder_attention_mask
+from src.modules.model import BabyLMELF
+from src.training.checkpoint import atomic_torch_save, select_model_weights
+from src.training.optim import create_scheduler, resolve_device, seed_everything
+from src.training.train import autocast_context, format_metrics, move_batch
 
 
 @dataclass

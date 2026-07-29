@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.distributed as dist
@@ -11,6 +11,7 @@ import torch.nn.functional as F
 class StepOutput:
     loss: torch.Tensor
     metrics: dict[str, float]
+    metric_weights: dict[str, float] = field(default_factory=dict)
 
 
 def _distributed_rank() -> int:
@@ -476,12 +477,6 @@ def train_step_elf(
         config.self_condition_cfg_min,
         config.self_condition_cfg_max,
     )
-    cfg_scale = torch.where(
-        decoder_active.bool(),
-        torch.ones_like(cfg_scale),
-        cfg_scale,
-    )
-
     self_condition = torch.zeros_like(clean)
     self_condition_rows = (
         self_condition_mask.view(batch_size).bool() & ~decoder_active.bool()
@@ -622,7 +617,7 @@ def train_step_elf(
                 segment_parts.append(
                     segment_ids.index_select(0, selected_global_rows)
                 )
-            cfg_parts.append(torch.ones(decoder_count, device=device, dtype=dtype))
+            cfg_parts.append(cfg_scale.index_select(0, selected_global_rows))
             decoder_active_parts.append(
                 torch.ones(decoder_count, device=device, dtype=dtype)
             )
@@ -645,10 +640,17 @@ def train_step_elf(
             loss=zero,
             metrics={
                 "loss": 0.0,
-                "flow": 0.0,
-                "ce": 0.0,
-                "acc": 0.0,
-                "decode_frac": float(decoder_active.float().mean()),
+                "flow_mse": 0.0,
+                "decoder_ce": 0.0,
+                "decoder_acc": 0.0,
+                "decoder_row_frac": float(decoder_active.float().mean()),
+            },
+            metric_weights={
+                "loss": 1.0,
+                "flow_mse": 0.0,
+                "decoder_ce": 0.0,
+                "decoder_acc": 0.0,
+                "decoder_row_frac": float(batch_size),
             },
         )
 
@@ -672,7 +674,13 @@ def train_step_elf(
         decoder_step_active=mixed_decoder_active,
     )
 
-    zero_from_forward = prediction.sum() * 0.0
+    zero_from_forward = prediction.float().sum() * 0.0
+    zero_from_forward = zero_from_forward + decoder_logits.float().sum() * 0.0
+    if base_model.mlm_mask_latent is not None:
+        zero_from_forward = (
+            zero_from_forward
+            + base_model.mlm_mask_latent.float().sum() * 0.0
+        )
     if decoder_count > 0:
         decoder_logits_slice = decoder_logits[:decoder_count]
         ce_mask = decoder_attention_mask.to(torch.float32) * ce_token_mask
@@ -710,16 +718,29 @@ def train_step_elf(
     denominator = lexical_mask.sum().clamp_min(1.0)
     decoder_weight = decoder_valid_mask.sum() / denominator
     flow_weight = l2_mask_original.sum() / denominator
-    loss = ce * decoder_weight + flow * flow_weight
+    loss = ce * decoder_weight + flow * flow_weight + zero_from_forward
+    decoder_token_count = (
+        float(ce_token_mask.sum().detach()) if decoder_count else 0.0
+    )
+    flow_token_count = (
+        float(l2_mask.sum().detach()) if denoiser_rows.numel() else 0.0
+    )
 
     return StepOutput(
         loss=loss,
         metrics={
             "loss": float(loss.detach()),
-            "flow": float(flow.detach()),
-            "ce": float(ce.detach()),
-            "acc": float(accuracy.detach()),
-            "decode_frac": float(decoder_active.float().mean()),
+            "flow_mse": float(flow.detach()),
+            "decoder_ce": float(ce.detach()),
+            "decoder_acc": float(accuracy.detach()),
+            "decoder_row_frac": float(decoder_active.float().mean()),
+        },
+        metric_weights={
+            "loss": 1.0,
+            "flow_mse": flow_token_count,
+            "decoder_ce": decoder_token_count,
+            "decoder_acc": decoder_token_count,
+            "decoder_row_frac": float(batch_size),
         },
     )
 
@@ -946,8 +967,8 @@ def train_step_standard_mdlm(
 ) -> StepOutput:
     if config.noise_schedule != "loglinear":
         raise ValueError("standard_mdlm requires noise_schedule='loglinear'.")
-    if config.time_conditioning != "t":
-        raise ValueError("standard_mdlm requires time_conditioning='t'.")
+    if config.time_conditioning:
+        raise ValueError("standard_mdlm requires time_conditioning=false.")
 
     base_model = unwrap_model(model)
     if base_model.flow_head is not None or base_model.self_cond_projection is not None:
@@ -990,10 +1011,11 @@ def train_step_standard_mdlm(
         device=input_ids.device,
         dtype=clean.dtype,
     )
+    model_t = torch.zeros_like(t)
     prediction, logits = forward_model(
         model,
         base_model.prepare_decoder_input(corrupted),
-        t,
+        model_t,
         attention_mask=attention_mask,
         segment_ids=segment_ids,
         self_cond_cfg_scale=torch.ones_like(decoder_active),
@@ -1030,15 +1052,16 @@ def train_step_standard_mdlm(
     return StepOutput(
         loss=mdlm_nelbo,
         metrics={
-            "loss": float(mdlm_nelbo.detach()),
-            "flow": 0.0,
-            "ce": float(masked_ce.detach()),
-            "acc": float(masked_accuracy.detach()),
-            "decode_frac": 1.0,
             "mdlm_nelbo": float(mdlm_nelbo.detach()),
             "masked_ce": float(masked_ce.detach()),
             "masked_acc": float(masked_accuracy.detach()),
             "mask_rate": float(mask_rate.detach()),
+        },
+        metric_weights={
+            "mdlm_nelbo": 1.0,
+            "masked_ce": float(masked_count.detach()),
+            "masked_acc": float(masked_count.detach()),
+            "mask_rate": float(eligible_count.detach()),
         },
     )
 

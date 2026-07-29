@@ -8,8 +8,8 @@ import torch
 import torch.nn as nn
 
 if TYPE_CHECKING:
-    from babylm_elf.config import RunConfig
-    from babylm_elf.modules.model import BabyLMELFConfig
+    from src.config import RunConfig
+    from src.modules.model import BabyLMELFConfig
 
 
 def build_scratch_encoder(config: BabyLMELFConfig):

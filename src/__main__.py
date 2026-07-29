@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python -m babylm_elf")
+    parser = argparse.ArgumentParser(prog="python -m src")
     commands = parser.add_subparsers(dest="command", required=True)
 
     train = commands.add_parser("train", help="Train an ELF experiment.")
@@ -54,20 +54,20 @@ def _parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = _parser().parse_args()
     if args.command == "train":
-        from babylm_elf.config import load_config
-        from babylm_elf.training.train import train_from_config
+        from src.config import load_config
+        from src.training.train import train_from_config
 
         train_from_config(load_config(args.config), resume_path=args.resume)
     elif args.command == "prepare":
-        from babylm_elf.data.prepare import prepare_from_config
+        from src.data.prepare import prepare_from_config
 
         prepare_from_config(args.config, args.world_size, staging=args.staging)
     elif args.command == "smoke-data":
-        from babylm_elf.data.prepare import smoke_data
+        from src.data.prepare import smoke_data
 
         smoke_data(args.config)
     elif args.command == "export":
-        from babylm_elf.export.hf import export_from_config
+        from src.export.hf import export_from_config
 
         export_from_config(
             args.config,
@@ -78,12 +78,12 @@ def main() -> None:
             track=args.track,
         )
     elif args.command == "train-encoder":
-        from babylm_elf.config import load_encoder_config
-        from babylm_elf.training.encoder import train_encoder_from_config
+        from src.config import load_encoder_config
+        from src.training.encoder import train_encoder_from_config
 
         train_encoder_from_config(load_encoder_config(args.config))
     elif args.command == "contextuality":
-        from babylm_elf.training.encoder import run_contextuality
+        from src.training.encoder import run_contextuality
 
         run_contextuality(
             args.config,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
 import math
 import os
 from pathlib import Path
@@ -11,30 +11,30 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from tqdm import tqdm
 
-from babylm_elf.config import (
+from src.config import (
     RunConfig,
     resolve_model_config,
     resolve_objective,
     resolve_run,
 )
-from babylm_elf.data.dataset import build_dataloader, validate_training_data_manifest
-from babylm_elf.data.prepare import empty_control_token_ids, load_tokenizer
-from babylm_elf.modules.encoder import (
+from src.data.dataset import build_dataloader, validate_training_data_manifest
+from src.data.prepare import empty_control_token_ids, load_tokenizer
+from src.modules.encoder import (
     scratch_encoder_parameter_ids,
     scratch_encoder_should_train,
     set_model_scratch_encoder_trainability,
     validate_embedding_source,
     zero_scratch_encoder_optimizer_lrs,
 )
-from babylm_elf.modules.layers import sdpa_backend_status
-from babylm_elf.modules.model import BabyLMELF
-from babylm_elf.training.checkpoint import (
+from src.modules.layers import sdpa_backend_status
+from src.modules.model import BabyLMELF
+from src.training.checkpoint import (
     CheckpointManager,
     load_training_checkpoint,
     restore_rank_rng_state,
 )
-from babylm_elf.training.objectives import train_step
-from babylm_elf.training.optim import (
+from src.training.objectives import train_step
+from src.training.optim import (
     ExponentialMovingAverage,
     TrainState,
     create_optimizer,
@@ -90,21 +90,77 @@ def is_main_process() -> bool:
 
 
 def format_metrics(metrics: dict[str, float]) -> str:
-    return " | ".join(f"{key}: {value:.4f}" for key, value in metrics.items())
+    return " | ".join(
+        (
+            f"{key}: {value:.3e}"
+            if key == "lr"
+            else f"{key}: {value:.4f}"
+        )
+        for key, value in metrics.items()
+    )
 
 
-def reduce_metrics(metrics: dict[str, float], device: torch.device) -> dict[str, float]:
-    if not is_distributed() or not metrics:
-        return metrics
-    keys = sorted(metrics)
+@dataclass
+class MetricTotals:
+    sums: dict[str, float] = field(default_factory=dict)
+    weights: dict[str, float] = field(default_factory=dict)
+
+    def update(
+        self,
+        metrics: dict[str, float],
+        metric_weights: dict[str, float],
+    ) -> None:
+        for key, value in metrics.items():
+            weight = float(metric_weights.get(key, 1.0))
+            if not math.isfinite(weight) or weight < 0.0:
+                raise FloatingPointError(
+                    f"Invalid metric weight for {key}: {weight}."
+                )
+            self.sums[key] = self.sums.get(key, 0.0) + float(value) * weight
+            self.weights[key] = self.weights.get(key, 0.0) + weight
+
+    def merge(self, other: "MetricTotals") -> None:
+        for key in other.sums:
+            self.sums[key] = self.sums.get(key, 0.0) + other.sums[key]
+            self.weights[key] = self.weights.get(key, 0.0) + other.weights[key]
+
+    def averages(self) -> dict[str, float]:
+        return {
+            key: (
+                self.sums[key] / self.weights[key]
+                if self.weights[key] > 0.0
+                else 0.0
+            )
+            for key in self.sums
+        }
+
+    def clear(self) -> None:
+        self.sums.clear()
+        self.weights.clear()
+
+    def __bool__(self) -> bool:
+        return bool(self.sums)
+
+
+def reduce_metric_totals(
+    totals: MetricTotals,
+    device: torch.device,
+) -> MetricTotals:
+    if not is_distributed() or not totals:
+        return totals
+    keys = list(totals.sums)
     values = torch.tensor(
-        [metrics[key] for key in keys],
+        [(totals.sums[key], totals.weights[key]) for key in keys],
         dtype=torch.float64,
         device=device,
     )
     dist.all_reduce(values, op=dist.ReduceOp.SUM)
-    values.div_(get_world_size())
-    return dict(zip(keys, values.cpu().tolist()))
+    reduced = MetricTotals()
+    host_values = values.cpu().tolist()
+    for key, (value_sum, weight_sum) in zip(keys, host_values):
+        reduced.sums[key] = value_sum
+        reduced.weights[key] = weight_sum
+    return reduced
 
 
 def move_batch(
@@ -136,7 +192,7 @@ def wrap_for_distributed(
         model,
         device_ids=[local_rank],
         output_device=local_rank,
-        find_unused_parameters=True,
+        find_unused_parameters=False,
     )
 
 
@@ -483,6 +539,7 @@ def train_from_config(
                 world_size=get_world_size(),
             )
 
+        window_metrics = MetricTotals()
         while state.microbatches_seen < total_microbatches:
             group_size = _next_group_size(
                 total_microbatches,
@@ -498,7 +555,7 @@ def train_from_config(
             )
             set_model_scratch_encoder_trainability(model, scratch_encoder_trainable)
             optimizer.zero_grad(set_to_none=True)
-            accum_metrics: dict[str, float] = {}
+            step_metrics = MetricTotals()
 
             for group_microbatch in range(group_size):
                 try:
@@ -550,8 +607,7 @@ def train_from_config(
                         )
                     loss.backward()
                 state.microbatches_seen += 1
-                for key, value in output.metrics.items():
-                    accum_metrics[key] = accum_metrics.get(key, 0.0) + value / group_size
+                step_metrics.update(output.metrics, output.metric_weights)
 
             clip_gradients(
                 model,
@@ -569,25 +625,32 @@ def train_from_config(
             ema.update(model)
             state.step += 1
 
-            accum_metrics["lr"] = scheduler.get_last_lr()[0]
-            accum_metrics["effective_batch"] = (
-                group_size
-                * config.training.batch_size
-                * get_world_size()
-            )
-            accum_metrics = reduce_metrics(accum_metrics, device)
+            step_metrics = reduce_metric_totals(step_metrics, device)
+            window_metrics.merge(step_metrics)
             if is_main_process():
                 progress.update(1)
-                if state.step % config.training.log_every == 0:
+            if state.step % config.training.log_every == 0:
+                if is_main_process():
+                    metrics = window_metrics.averages()
+                    metrics["lr"] = scheduler.get_last_lr()[0]
                     progress.write(
-                        f"step {state.step} | {format_metrics(accum_metrics)}"
+                        f"step {state.step} | {format_metrics(metrics)}"
                     )
+                window_metrics.clear()
 
             checkpoints.save_if_due(
                 state,
                 progress if is_main_process() else None,
             )
 
+        if window_metrics:
+            if is_main_process():
+                metrics = window_metrics.averages()
+                metrics["lr"] = scheduler.get_last_lr()[0]
+                progress.write(
+                    f"step {state.step} | {format_metrics(metrics)}"
+                )
+            window_metrics.clear()
         checkpoints.save_final(state)
         if config.training.max_steps <= 0 and state.step != resolved.max_steps:
             raise RuntimeError(

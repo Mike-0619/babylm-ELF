@@ -14,10 +14,10 @@ try:
     from .layers import PositionAttention as _hf_cache_layers_import
     from .encoder_modeling import build_scratch_encoder as _hf_cache_encoder_import
 except ImportError:
-    from babylm_elf.modules.encoder import (
+    from src.modules.encoder import (
         build_scratch_encoder as _hf_cache_encoder_import,
     )
-    from babylm_elf.modules.layers import PositionAttention as _hf_cache_layers_import
+    from src.modules.layers import PositionAttention as _hf_cache_layers_import
 
 try:
     from .layers import RMSNorm as _BabyLMELFRMSNorm
@@ -27,12 +27,12 @@ except ImportError:
 try:
     from .configuration_babylm_elf import BabyLMELFHFConfig
 except ImportError:
-    from babylm_elf.export.configuration import BabyLMELFHFConfig
+    from src.export.configuration import BabyLMELFHFConfig
 
 try:
     from .modeling_core import BabyLMELF, BabyLMELFConfig
 except ImportError:
-    from babylm_elf.modules.model import BabyLMELF, BabyLMELFConfig
+    from src.modules.model import BabyLMELF, BabyLMELFConfig
 
 class BabyLMELFHFModel(PreTrainedModel):
     """ELF encoder interface used by BabyLM finetuning tasks."""
@@ -112,6 +112,12 @@ class BabyLMELFHFModel(PreTrainedModel):
         self.babylm_elf._configure_embedding_trainability()
         return result
 
+    def _uses_time_conditioning(self) -> bool:
+        evaluation = getattr(self.config, "evaluation_config", {}) or {}
+        if evaluation.get("adapter") != "mdlm_subs_v1":
+            return True
+        return bool(evaluation.get("time_conditioning", False))
+
     def _decoder_hidden(
         self,
         z_t: torch.Tensor,
@@ -122,6 +128,8 @@ class BabyLMELFHFModel(PreTrainedModel):
         batch_size = z_t.size(0)
         if t is None:
             t = torch.ones(batch_size, device=z_t.device, dtype=z_t.dtype)
+        if not self._uses_time_conditioning():
+            t = torch.zeros_like(t)
         return self.babylm_elf.forward_hidden(
             self.babylm_elf.prepare_decoder_input(z_t),
             t,
@@ -154,7 +162,7 @@ class BabyLMELFHFModel(PreTrainedModel):
                 attention_mask=attention_mask,
             )
             z_t = self._apply_context_ablation(z_t, input_ids, attention_mask)
-        elif t is None:
+        elif t is None and self._uses_time_conditioning():
             raise ValueError("Provide t when passing z_t directly.")
 
         hidden = self._decoder_hidden(z_t, attention_mask, t, position_ids)
@@ -205,13 +213,6 @@ class BabyLMELFForMaskedLM(BabyLMELFHFModel):
                     embeddings,
                     mask_positions,
                     adapter,
-                )
-            if adapter == "mdlm_subs_v1" and t is None:
-                t = self._mdlm_time_from_mask_ratio(
-                    input_ids,
-                    attention_mask,
-                    mask_positions,
-                    dtype=embeddings.dtype,
                 )
             logits = self._direct_logits_from_embeddings(
                 embeddings, attention_mask, t, position_ids
@@ -316,42 +317,6 @@ class BabyLMELFForMaskedLM(BabyLMELFHFModel):
             replacement,
             embeddings,
         )
-
-    def _mdlm_time_from_mask_ratio(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor | None,
-        mask_positions: torch.Tensor,
-        *,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        evaluation = getattr(self.config, "evaluation_config", {}) or {}
-        special_token_count = int(evaluation.get("special_token_count", 16))
-        excluded_token_ids = tuple(
-            int(token_id)
-            for token_id in evaluation.get("excluded_token_ids", ())
-        )
-        active = (
-            torch.ones_like(input_ids, dtype=torch.bool)
-            if attention_mask is None
-            else attention_mask.bool()
-        )
-        eligible = active & (
-            input_ids.ge(special_token_count) | mask_positions
-        )
-        if excluded_token_ids:
-            excluded = torch.as_tensor(
-                excluded_token_ids,
-                device=input_ids.device,
-                dtype=input_ids.dtype,
-            )
-            eligible &= ~torch.isin(input_ids, excluded) | mask_positions
-        masked_count = (mask_positions & eligible).sum(dim=-1).float()
-        eligible_count = eligible.sum(dim=-1).float().clamp_min(1.0)
-        noise_eps = float(evaluation.get("mdlm_noise_eps", 1.0e-3))
-        sampling_eps = float(evaluation.get("mdlm_sampling_eps", 1.0e-3))
-        inferred = masked_count / eligible_count / (1.0 - noise_eps)
-        return inferred.clamp(min=sampling_eps, max=1.0).to(dtype=dtype)
 
     def _apply_mdlm_subs(
         self,

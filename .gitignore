@@ -12,7 +12,6 @@ __pycache__/
 /slurm-*.err
 
 # Local-only workflow
-/AGENTS.md
 /scripts/local/
 /docs/
 /paper/

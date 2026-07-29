@@ -60,5 +60,5 @@ objective:
   sampling_eps: 0.001
   noise_eps: 0.001
   antithetic_sampling: true
-  time_conditioning: t
+  time_conditioning: false
   sampling_steps: 128

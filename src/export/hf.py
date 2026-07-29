@@ -12,9 +12,9 @@ from safetensors.torch import save_file
 import torch
 from tokenizers import Tokenizer
 
-from babylm_elf.config import RunConfig, load_config
-from babylm_elf.modules.model import BabyLMELF, BabyLMELFConfig
-from babylm_elf.training.checkpoint import (
+from src.config import RunConfig, load_config
+from src.modules.model import BabyLMELF, BabyLMELFConfig
+from src.training.checkpoint import (
     ModelWeights,
     infer_track,
     required_revisions,
@@ -306,6 +306,9 @@ def _evaluation_config(objective: dict[str, Any]) -> dict[str, Any]:
                 "mdlm_sampling_steps": int(
                     objective.get("sampling_steps", 128)
                 ),
+                "time_conditioning": bool(
+                    objective.get("time_conditioning", False)
+                ),
                 "subs_mask_suppression": True,
                 "subs_carry_over": True,
             }
@@ -351,6 +354,9 @@ def _training_metadata(
         "tokenizer_path": str(data["tokenizer_path"]),
         "train_path": str(data["train_path"]),
         "max_steps": int(resolved["max_steps"]),
+        "training_semantics_version": int(
+            resolved["training_semantics_version"]
+        ),
         "word_exposure_offset": int(
             run["training"]["word_exposure_offset"]
         ),

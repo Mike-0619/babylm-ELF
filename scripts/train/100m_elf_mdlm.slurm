@@ -9,8 +9,11 @@
 
 set -euo pipefail
 
+export OMP_NUM_THREADS=2
+
 cd "${SLURM_SUBMIT_DIR:?Submit from the repository root}"
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 srun torchrun --standalone --nproc_per_node=4 \
-  -m babylm_elf train \
+  -m src train \
   --config configs/100m/elf_mdlm.yml \
   --resume auto

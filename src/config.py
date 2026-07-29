@@ -8,8 +8,11 @@ from typing import Any, TypeAlias, get_type_hints
 
 import yaml
 
-from babylm_elf.modules.model import BabyLMELFConfig
-from babylm_elf.training.optim import resolve_ema_decay
+from src.modules.model import BabyLMELFConfig
+from src.training.optim import resolve_ema_decay
+
+
+TRAINING_SEMANTICS_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -163,7 +166,7 @@ class MDLMObjectiveConfig:
     sampling_eps: float = 1.0e-3
     noise_eps: float = 1.0e-3
     antithetic_sampling: bool = True
-    time_conditioning: str = "t"
+    time_conditioning: bool = False
     sampling_steps: int = 128
     mask_latent_seed: int = 0
     mask_latent_scale: float = 1.0
@@ -201,6 +204,7 @@ class ResolvedRun:
     warmup_steps: int
     ema_decay: float
     actual_train_word_count: int
+    training_semantics_version: int
 
 
 @dataclass
@@ -365,6 +369,7 @@ def resolve_run(
         warmup_steps=warmup_steps,
         ema_decay=ema_decay,
         actual_train_word_count=actual_train_word_count,
+        training_semantics_version=TRAINING_SEMANTICS_VERSION,
     )
 
 
@@ -455,8 +460,8 @@ def _validate_run_config(config: RunConfig) -> None:
             raise ValueError("MDLM sampling_eps must be in (0, 1).")
         if not 0.0 <= objective.noise_eps < 1.0:
             raise ValueError("MDLM noise_eps must be in [0, 1).")
-        if objective.time_conditioning != "t":
-            raise ValueError("standard_mdlm requires time_conditioning='t'.")
+        if objective.time_conditioning:
+            raise ValueError("standard_mdlm requires time_conditioning=false.")
         if objective.sampling_steps < 1:
             raise ValueError("MDLM sampling_steps must be positive.")
 

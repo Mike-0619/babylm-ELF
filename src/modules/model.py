@@ -17,7 +17,7 @@ try:
         set_scratch_encoder_trainability,
     )
 except ImportError:
-    from babylm_elf.modules.encoder import (
+    from src.modules.encoder import (
         build_scratch_encoder,
         embed_with_scratch_encoder,
         initialize_gaussian_embedding,
@@ -439,6 +439,8 @@ class BabyLMELF(nn.Module):
                     f"{2 * self.config.embedding_size}, got {x.size(-1)}"
                 )
             x = self.text_projection(x.float())
+            if self.config.training_objective == "standard_mdlm":
+                t = torch.zeros_like(t)
             context = self.build_context(t, self_cond_cfg_scale)
 
         mode = self._build_mode_tokens(

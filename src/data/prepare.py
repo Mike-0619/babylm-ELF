@@ -18,8 +18,8 @@ from tokenizers import Regex, Tokenizer, decoders, normalizers, pre_tokenizers, 
 from tokenizers.models import BPE
 from tokenizers.trainers import BpeTrainer
 
-from babylm_elf.config import load_config
-from babylm_elf.data.dataset import (
+from src.config import load_config
+from src.data.dataset import (
     HFExportStats,
     MAX_TOKEN_ID,
     NORMALIZATION_NAME,

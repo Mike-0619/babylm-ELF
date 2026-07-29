@@ -1,19 +1,20 @@
 # BabyLM ELF
 
-BabyLM 2026 ELF experiments with five Strict-Small 10M routes and two Strict
-100M ELF-B routes. The official source tree at `../ELF` is a read-only
-reference; all BabyLM code and configuration live here. Four AdamW routes form
-the objective-controlled main comparison; the fifth is an optimizer-controlled
-Muon noisy-CE comparison.
+ELF-style language-model experiments for BabyLM 2026, with five Strict-Small
+10M routes and two Strict 100M ELF-B routes. Four 10M AdamW routes form the
+objective-controlled comparison; the fifth is an optimizer-controlled Muon
+noisy-CE comparison.
 
 ## Install
 
 ```bash
-conda activate babylm-elf
-pip install -r requirements.txt
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-Install a PyTorch build compatible with the cluster's CUDA driver.
+Use a PyTorch build compatible with the target CUDA driver.
 
 ## Prepare Data
 
@@ -21,9 +22,9 @@ Build and validate the canonical schema-v3 manifests, tokenizers, and
 `flat_int16_le_v1` streams:
 
 ```bash
-python -m babylm_elf prepare \
+python -m src prepare \
   --config configs/10m/elf_noisy.yml --world-size 4 --staging
-python -m babylm_elf prepare \
+python -m src prepare \
   --config configs/100m/elf_noisy.yml --world-size 4 --staging
 ```
 
@@ -42,7 +43,7 @@ An optional four-rank data smoke is available:
 
 ```bash
 torchrun --standalone --nproc_per_node=4 \
-  -m babylm_elf smoke-data \
+  -m src smoke-data \
   --config configs/10m/elf_noisy.yml \
   --config configs/100m/elf_noisy.yml
 ```
@@ -57,15 +58,15 @@ scripts/prepare/prepare_2026_100M.slurm
 The package has one command surface:
 
 ```text
-python -m babylm_elf {train,prepare,smoke-data,export,train-encoder,contextuality}
+python -m src {train,prepare,smoke-data,export,train-encoder,contextuality}
 ```
 
-Run `python -m babylm_elf COMMAND --help` for command-specific arguments.
+Run `python -m src COMMAND --help` for command-specific arguments.
 
 ## Source Layout
 
 ```text
-babylm_elf/
+src/
 ├── config.py       # strict YAML parsing and resolved runs
 ├── modules/        # ELF model, layers, attention, and embeddings
 ├── training/       # objectives, loop, optimizers, checkpoints, encoder jobs
@@ -93,19 +94,28 @@ The two 100M ELF-B experiments are:
 | Standard MDLM | `configs/100m/elf_mdlm.yml` | `scripts/train/100m_elf_mdlm.slurm` |
 
 The tracked templates contain only portable resource requests. Activate a
-working Python environment and submit them from the repository root. Keep
-site-specific partitions, GPU selectors, hosts, and environment paths in
-ignored wrappers under `scripts/local/`.
+working Python environment, submit from the repository root, and provide
+site-specific scheduling options through `sbatch`:
+
+```bash
+sbatch --partition=YOUR_PARTITION scripts/train/10m_elf_noisy.slurm
+```
 
 For a direct launch, pass the experiment config explicitly:
 
 ```bash
 torchrun --standalone --nproc_per_node=4 \
-  -m babylm_elf train \
+  -m src train \
   --config configs/10m/elf_mlm_cyclic.yml
 ```
 
 `--config` is required; training never selects an implicit experiment.
+
+Training logs report 50-step window averages with token-count-weighted
+decoder/MDLM metrics across all ranks. ELF `loss` mixes decoder CE and flow MSE;
+MDLM reports its `CE/t` NELBO. Noisy-CE accuracy, BERT15 target accuracy, and
+MDLM masked-token accuracy use different corruptions and must not be compared
+as the same metric.
 
 ## Resume
 
@@ -113,7 +123,7 @@ Resume automatically from format-v4 `latest.pt`:
 
 ```bash
 torchrun --standalone --nproc_per_node=4 \
-  -m babylm_elf train \
+  -m src train \
   --config configs/10m/elf_mlm_cyclic.yml \
   --resume auto
 ```
@@ -121,21 +131,23 @@ torchrun --standalone --nproc_per_node=4 \
 Revision checkpoints are lightweight evaluation artifacts and are not accepted
 for training resume. `auto` starts only when the run directory is empty; it
 refuses to overwrite revision artifacts when `latest.pt` is missing. An
-explicit checkpoint path remains supported.
+explicit checkpoint path remains supported. Checkpoints also carry training
+semantics version 2; older semantics are rejected even when the container
+format is v4.
 
 ## Export
 
 Export EMA weights for the main checkpoint:
 
 ```bash
-python -m babylm_elf export \
+python -m src export \
   --config configs/10m/elf_mlm_cyclic.yml
 ```
 
 Export the main checkpoint plus every required exposure revision:
 
 ```bash
-python -m babylm_elf export \
+python -m src export \
   --config configs/10m/elf_mlm_cyclic.yml \
   --all-revisions --track strict-small
 ```
