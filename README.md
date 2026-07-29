@@ -6,9 +6,6 @@ reference; all BabyLM code and configuration live here. Four AdamW routes form
 the objective-controlled main comparison; the fifth is an optimizer-controlled
 Muon noisy-CE comparison.
 
-The complete model, objective, optimizer, exposure, checkpoint, and adapter
-specification is in [project.md](project.md).
-
 ## Install
 
 ```bash
